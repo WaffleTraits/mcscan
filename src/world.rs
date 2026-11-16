@@ -156,6 +156,20 @@ pub fn discover(world: &Path) -> Result<Vec<WorldFile>> {
     Ok(out)
 }
 
+/// Bukkit-style servers (Spigot, Paper, ...) keep the Nether and the End in
+/// their own folders next to the main world: `world_nether`, `world_the_end`.
+/// Returns the ones that exist for this world.
+pub fn sibling_worlds(world: &Path) -> Vec<PathBuf> {
+    let (Some(parent), Some(name)) = (world.parent(), world.file_name().and_then(|n| n.to_str())) else {
+        return Vec::new();
+    };
+    ["_nether", "_the_end"]
+        .iter()
+        .map(|suffix| parent.join(format!("{name}{suffix}")))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
 /// PID of the process that has this world open (the game holds an fcntl lock
 /// on `session.lock` while a world is loaded), if any.
 #[cfg(unix)]

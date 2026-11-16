@@ -247,6 +247,24 @@ villagers, allays, donkeys and llamas.
 Not scanned: structure templates under `generated/` (they are blueprints, not
 placed blocks) and chunks the server has not written to disk yet.
 
+If a scan finds fewer items than you expect, the summary helps tell why:
+
+```
+Looked inside 382 placed block(s) with data (chests, barrels, furnaces, ...), 291 entities and 1 player file(s)
+note: 254 container(s) still have an unopened loot table - the game only creates their contents when ...
+```
+
+* **Unopened loot.** Chests, barrels, dispensers and pots generated with a
+  structure hold only the name of a loot table until a player opens them.
+  Their items do not exist yet, so there is nothing to find.
+* **`--preset illegal` lists illegal items only.** Use `--all-items` (or a
+  `--filter`) to see everything that is stored.
+* **Paper/Spigot keep the Nether and the End in separate folders**
+  (`world_nether`, `world_the_end`). mcscan points them out when they sit
+  next to the world you scan; scan each one.
+* **A running server** has recent changes in memory. Run `save-all flush`
+  first.
+
 ## Results file
 
 JSON Lines: a header line, then one object per finding with `n`, `id`,

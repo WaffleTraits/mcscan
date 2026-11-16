@@ -51,6 +51,12 @@ pub struct Stats {
     pub chunks: AtomicU64,
     pub items: AtomicU64,
     pub matches: AtomicU64,
+    /// Placed blocks with data (chests, furnaces, signs, ...) that were read.
+    pub block_entities: AtomicU64,
+    /// Of those, containers whose loot has not been generated yet.
+    pub unopened_loot: AtomicU64,
+    /// Entities (mobs, item frames, minecarts, ...) that were read.
+    pub entities: AtomicU64,
     pub errors: AtomicU64,
     first_errors: Mutex<Vec<String>>,
     /// Set to make the workers stop early; `execute` then fails with "cancelled".
@@ -102,6 +108,28 @@ fn source_of(category: Category, path: &[SegRef]) -> &'static str {
     }
 }
 
+/// Count what this tree holds, so the summary can say what was looked into.
+fn count_holders(root: &Compound, category: Category, stats: &Stats) {
+    // Pre-1.18 chunks nest everything in "Level".
+    let level = root.compound("Level").unwrap_or(root);
+    let len = |c: &Compound, keys: [&str; 2]| keys.iter().find_map(|k| c.list(k)).map_or(0, |l| l.items.len() as u64);
+    match category {
+        Category::Chunks => {
+            if let Some(list) = level.list("block_entities").or_else(|| level.list("TileEntities")) {
+                stats.block_entities.fetch_add(list.items.len() as u64, Ordering::Relaxed);
+                let unopened =
+                    list.items.iter().filter(|t| t.as_compound().map_or(false, |c| c.contains("LootTable"))).count();
+                stats.unopened_loot.fetch_add(unopened as u64, Ordering::Relaxed);
+            }
+            stats.entities.fetch_add(len(level, ["entities", "Entities"]), Ordering::Relaxed);
+        }
+        Category::Entities => {
+            stats.entities.fetch_add(len(root, ["Entities", "entities"]), Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
 /// Scan one parsed NBT tree (a chunk, a player file, ...).
 fn scan_tree(root: &Compound, file: &WorldFile, chunk: Option<(i32, i32)>, opts: &ScanOptions, stats: &Stats) -> Vec<Record> {
     let player = match file.category {
@@ -110,6 +138,7 @@ fn scan_tree(root: &Compound, file: &WorldFile, chunk: Option<(i32, i32)>, opts:
         _ => None,
     };
     let player_dim = player.and_then(|p| p.str("Dimension"));
+    count_holders(root, file.category, stats);
     let uuid = file.player();
 
     let mut out = Vec::new();
@@ -312,11 +341,34 @@ pub struct ScanOutput {
     pub total_bytes: u64,
     pub chunks: u64,
     pub items: u64,
+    pub block_entities: u64,
+    pub unopened_loot: u64,
+    pub entities: u64,
+    pub player_files: u64,
     pub errors: u64,
     pub first_errors: Vec<String>,
 }
 
 impl ScanOutput {
+    /// What was looked into, so "nothing found" can be told apart from
+    /// "nothing read".
+    pub fn coverage_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "Looked inside {} placed block(s) with data (chests, barrels, furnaces, ...), {} entities and {} player file(s)",
+            human_count(self.block_entities),
+            human_count(self.entities),
+            human_count(self.player_files),
+        )];
+        if self.unopened_loot > 0 {
+            lines.push(format!(
+                "note: {} container(s) still have an unopened loot table - the game only creates their contents \
+                 when a player first opens them, so they hold no items on disk yet",
+                human_count(self.unopened_loot)
+            ));
+        }
+        lines
+    }
+
     /// "Scanned 1,234 chunks and 567 item stacks in 0.45s (5.0 GiB/s)"
     pub fn speed_line(&self) -> String {
         let secs = self.elapsed.as_secs_f64().max(0.001);
@@ -387,6 +439,10 @@ pub fn execute(plan: &Plan, opts: &ScanOptions, stats: &Stats) -> Result<ScanOut
         total_bytes: plan.total_bytes,
         chunks: stats.chunks.load(Ordering::Relaxed),
         items: stats.items.load(Ordering::Relaxed),
+        block_entities: stats.block_entities.load(Ordering::Relaxed),
+        unopened_loot: stats.unopened_loot.load(Ordering::Relaxed),
+        entities: stats.entities.load(Ordering::Relaxed),
+        player_files: plan.files.iter().filter(|f| f.category == Category::Players).count() as u64,
         errors: stats.errors.load(Ordering::Relaxed),
         first_errors,
     })
@@ -428,6 +484,13 @@ pub fn run(opts: ScanOptions) -> Result<()> {
                  changes still in memory are not on disk yet - run `save-all flush` first for an exact result."
             );
         }
+        for other in world::sibling_worlds(&plan.world) {
+            eprintln!(
+                "note: {} is a separate world folder (servers such as Paper/Spigot keep the Nether and the End\n      \
+                 there) and is not part of this scan - scan it as well.",
+                other.display()
+            );
+        }
         eprintln!(
             "Scanning {} ({} files, {}) with {} thread{}",
             plan.world.display(),
@@ -466,6 +529,9 @@ pub fn run(opts: ScanOptions) -> Result<()> {
 
     if !opts.quiet {
         eprintln!("{}", out.speed_line());
+        for line in out.coverage_lines() {
+            eprintln!("{line}");
+        }
         if out.errors > 0 {
             eprintln!("warning: {} chunk(s)/file(s) could not be read and were skipped:", human_count(out.errors));
             for e in &out.first_errors {

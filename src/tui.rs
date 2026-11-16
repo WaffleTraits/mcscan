@@ -274,6 +274,8 @@ struct App {
     pager_height: usize,
     last_click: Option<(Instant, usize)>,
     status: String,
+    /// What the last scan looked into (shown under the list).
+    coverage: Vec<String>,
     /// The world was changed since the findings were scanned.
     stale: bool,
     quit: bool,
@@ -305,6 +307,7 @@ impl App {
             pager_height: 10,
             last_click: None,
             status: String::new(),
+            coverage: Vec::new(),
             stale: false,
             quit: false,
             fatal: None,
@@ -432,6 +435,10 @@ impl App {
                     Ok(()) => status.push_str(&format!(", saved to {}", self.cfg.results_path)),
                     Err(e) => status.push_str(&format!(" - NOT saved: {e:#}")),
                 }
+                self.coverage = out.coverage_lines();
+                self.coverage.extend(world::sibling_worlds(&PathBuf::from(&out.header.world)).iter().map(|p| {
+                    format!("note: {} is a separate world folder and is not part of this scan - scan it as well", p.display())
+                }));
                 if out.errors > 0 {
                     status.push_str(&format!(" - {} unreadable chunk(s)/file(s) skipped", human_count(out.errors)));
                 }
@@ -607,6 +614,7 @@ Acting  (on the selection, or on the current finding if nothing is selected)
   nothing is written until you confirm that preview.
 
 Other
+  c                   what the last scan looked into (blocks, entities, players)
   r                   rescan the world
   m                   mouse support on/off (off lets the terminal select text)
   ?                   this help              q, Ctrl-C   quit
@@ -842,6 +850,14 @@ changed since the scan are skipped, and modified files are backed up to
             }
             KeyCode::Char('S') => self.set_sort(self.sort),
             KeyCode::Char('r') => self.start_scan(),
+            KeyCode::Char('c') => {
+                let lines = if self.coverage.is_empty() {
+                    vec!["These findings were loaded from a file; rescan (r) to see what a scan looks into.".to_string()]
+                } else {
+                    self.coverage.clone()
+                };
+                self.message("What the scan looked into", lines);
+            }
             KeyCode::Char('m') => {
                 self.set_mouse(!self.mouse);
                 self.status = if self.mouse {
@@ -1058,7 +1074,11 @@ changed since the scan are skipped, and modified files are backed up to
             } else {
                 "Nothing matches the filter (Esc clears it)."
             };
-            f.render_widget(Paragraph::new(format!("\n  {msg}")).style(Style::new().fg(Color::DarkGray)), table);
+            let mut text = format!("\n  {msg}\n");
+            for line in &self.coverage {
+                text.push_str(&format!("\n  {line}"));
+            }
+            f.render_widget(Paragraph::new(text).style(Style::new().fg(Color::DarkGray)).wrap(Wrap { trim: false }), table);
         } else {
             let mut lines = Vec::with_capacity(h);
             for (row, &i) in self.view.iter().enumerate().skip(self.offset).take(h) {
