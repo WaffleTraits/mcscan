@@ -493,6 +493,88 @@ pub fn run(opts: ScanOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::item::testutil::item as snbt;
+
+    /// Every block entity of 26.3 that stores item stacks, with the NBT it
+    /// keeps them in (`$I` = an item stack) and how many stacks that is.
+    /// The list comes from the game jar: see tools/survey_block_entities.py.
+    const HOLDERS: [(&str, &str, usize); 24] = [
+        ("chest", "Items:[$I]", 1),
+        ("trapped_chest", "Items:[$I]", 1),
+        ("barrel", "Items:[$I]", 1),
+        ("shulker_box", "Items:[$I]", 1),
+        ("hopper", "Items:[$I]", 1),
+        ("dropper", "Items:[$I]", 1),
+        ("dispenser", "Items:[$I]", 1),
+        ("crafter", "Items:[$I]", 1),
+        ("furnace", "Items:[$I]", 1),
+        ("blast_furnace", "Items:[$I]", 1),
+        ("smoker", "Items:[$I]", 1),
+        ("brewing_stand", "Items:[$I]", 1),
+        ("campfire", "Items:[$I]", 1),
+        ("chiseled_bookshelf", "Items:[$I]", 1),
+        ("shelf", "Items:[$I]", 1),
+        ("jukebox", "RecordItem:$I", 1),
+        ("lectern", "Book:$I", 1),
+        ("decorated_pot", "item:$I", 1),
+        ("brushable_block", "item:$I", 1),
+        ("vault", "config:{key_item:$I},server_data:{items_to_eject:[$I,$I]},shared_data:{display_item:$I}", 4),
+        // These hold mobs, and mobs hold items.
+        (
+            "mob_spawner",
+            "SpawnData:{entity:{id:\"minecraft:zombie\",equipment:{mainhand:$I}}},\
+             SpawnPotentials:[{weight:1,data:{entity:{id:\"minecraft:zombie\",equipment:{head:$I}}}}]",
+            2,
+        ),
+        ("trial_spawner", "spawn_data:{entity:{id:\"minecraft:zombie\",equipment:{offhand:$I}}}", 1),
+        ("beehive", "bees:[{entity_data:{id:\"minecraft:bee\",equipment:{mainhand:$I}},ticks_in_hive:0}]", 1),
+        // A container kept inside another block entity's item, any depth.
+        (
+            "barrel",
+            "Items:[{Slot:0b,id:\"minecraft:chest\",count:1,components:{\"minecraft:container\":[{slot:0,item:$I}],\
+             \"minecraft:block_entity_data\":{id:\"minecraft:chest\",Items:[$I]}}}]",
+            2,
+        ),
+    ];
+
+    /// Build a chunk holding one of each, push it through the same
+    /// serialise / skip-parse path a region file takes, and return for each
+    /// block entity position how many `bedrock` stacks the preset flagged.
+    fn flagged_per_holder(stack: &str) -> Vec<usize> {
+        let mut chunk = String::from("{DataVersion:5023,Status:\"minecraft:full\",sections:[{Y:0b}],block_entities:[");
+        for (i, (id, body, _)) in HOLDERS.iter().enumerate() {
+            chunk.push_str(&format!("{{id:\"minecraft:{id}\",x:{i},y:64,z:0,{}}},", body.replace("$I", stack)));
+        }
+        chunk.push_str("]}");
+        let bytes = nbt::write_root("", &snbt(&chunk)).unwrap();
+        let (_, root) = nbt::parse_skipping(&bytes, &CHUNK_SKIP).unwrap();
+        assert!(!root.contains("sections"), "skipped keys must not hide block entities");
+
+        let preset = Preset::load("illegal").unwrap();
+        let mut found = vec![0; HOLDERS.len()];
+        item::walk_items(&root, &mut |hit| {
+            let view = ItemView::new(hit.item).unwrap();
+            let mut reasons = Vec::new();
+            preset.check(&view, hit.parents, &mut reasons);
+            if view.id == "minecraft:bedrock" {
+                assert!(reasons.iter().any(|r| r.rule.id() == "unobtainable_item"), "{reasons:?}");
+                found[hit.pos.expect("block entity position")[0] as usize] += 1;
+            }
+        });
+        found
+    }
+
+    #[test]
+    fn every_item_holding_block_entity() {
+        let want: Vec<usize> = HOLDERS.iter().map(|h| h.2).collect();
+        let names: Vec<&str> = HOLDERS.iter().map(|h| h.0).collect();
+        // 26.x, as the game writes it.
+        assert_eq!(flagged_per_holder(r#"{Slot:0b,id:"minecraft:bedrock",count:64}"#), want, "{names:?}");
+        // Without a count (the game reads that as 1).
+        assert_eq!(flagged_per_holder(r#"{Slot:0b,id:"minecraft:bedrock"}"#), want, "{names:?}");
+        // Pre-1.20.5 stacks.
+        assert_eq!(flagged_per_holder(r#"{Slot:0b,id:"minecraft:bedrock",Count:64b,tag:{Unbreakable:1b}}"#), want, "{names:?}");
+    }
 
     #[test]
     fn progress_line_shows_rate_and_eta() {

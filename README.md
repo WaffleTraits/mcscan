@@ -216,6 +216,37 @@ mcscan scan world --preset my-26.4.json
 Stack sizes, the unobtainable list and the denied components are plain lists
 at the top of that script.
 
+## What gets scanned
+
+mcscan does not work from a list of container blocks. It reads every block
+entity, entity and player file and recognises item stacks by their shape,
+wherever they sit and however deeply they are nested, so a block added by a
+new game version or a data pack is covered without an update.
+
+As a cross-check, the block entities of the 26.3 jar were surveyed
+(`tools/survey_block_entities.py <jar>` repeats that for any 26.1+ jar). Of
+the 49 types the game registers, these store item stacks, and a test
+(`every_item_holding_block_entity`) puts an illegal item in each one and
+requires it to be found:
+
+| stored in | blocks |
+| --- | --- |
+| `Items` | chest, trapped chest, barrel, shulker boxes, hopper, dropper, dispenser, crafter, furnace, blast furnace, smoker, brewing stand, campfire and soul campfire, chiseled bookshelf, shelf |
+| `item` | decorated pot, suspicious sand and gravel |
+| `Book`, `RecordItem` | lectern, jukebox |
+| `key_item`, `items_to_eject`, `display_item` | vault |
+| a stored mob's equipment | spawner, trial spawner, beehive and bee nest |
+
+Ender chests keep their contents in the player files, which are scanned.
+Containers held as items (a chest item with contents, a shulker box in a
+bundle) are followed to any depth. Everything else that carries items is an
+entity and is scanned the same way: item frames, armour stands, minecarts and
+boats with chests or hoppers, dropped items, mobs and their equipment,
+villagers, allays, donkeys and llamas.
+
+Not scanned: structure templates under `generated/` (they are blueprints, not
+placed blocks) and chunks the server has not written to disk yet.
+
 ## Results file
 
 JSON Lines: a header line, then one object per finding with `n`, `id`,

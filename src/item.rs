@@ -45,10 +45,17 @@ struct Ctx<'a> {
 }
 
 /// Keys whose value is an item stack even if it carries no count.
-const ITEM_KEYS: [&str; 24] = [
+///
+/// Block entities (checked against the 26.3 jar with
+/// tools/survey_block_entities.py): `Items` for every container, campfire,
+/// chiseled bookshelf and shelf; `item` for decorated pots and suspicious
+/// sand/gravel; `Book` for lecterns; `RecordItem` for jukeboxes; `key_item`,
+/// `items_to_eject` and `display_item` for vaults. The rest belong to
+/// entities, players and villager trades.
+const ITEM_KEYS: [&str; 30] = [
     "Items", "Inventory", "EnderItems", "item", "Item", "items", "Book", "RecordItem", "HandItems", "ArmorItems",
     "mainhand", "offhand", "head", "chest", "legs", "feet", "body", "saddle", "SelectedItem", "FireworksItem", "sell",
-    "ArmorItem", "SaddleItem", "DecorItem",
+    "ArmorItem", "SaddleItem", "DecorItem", "key_item", "items_to_eject", "display_item", "buy", "buyB", "weapon",
 ];
 
 /// Is this compound an item stack? Returns its id if so.

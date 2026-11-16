@@ -1,2 +1,3 @@
 /target
 mcscan-results.jsonl
+__pycache__/
