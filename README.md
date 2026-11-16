@@ -12,15 +12,33 @@ Built for 26.3 and its world layout (`dimensions/<namespace>/<name>/…`,
 `region/` / `DIM-1/` / `playerdata/` layout, the 1.20.5+ component item
 format, and the pre-1.20.5 `tag` format are all understood.
 
-## Build
+## Install
 
 ```sh
+cargo install --locked --git https://github.com/WaffleTraits/mcscan
+```
+
+This builds the optimised binary and puts `mcscan` in `~/.cargo/bin`. Run the
+same command again to update; `cargo uninstall mcscan` removes it.
+
+Needs a current stable Rust toolchain and a C linker. On a fresh
+Debian/Ubuntu machine:
+
+```sh
+sudo apt install -y gcc curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+## Build from a checkout
+
+```sh
+git clone https://github.com/WaffleTraits/mcscan && cd mcscan
 cargo build --release          # binary: target/release/mcscan
+cargo install --locked --path . # or install it into ~/.cargo/bin
 cargo test                     # unit tests
 ```
 
-Needs a current stable Rust toolchain (https://rustup.rs) and a C linker
-(`gcc`). All dependencies are pure Rust.
+All dependencies are pure Rust.
 
 Prebuilt x86-64 binaries are in `dist/`:
 

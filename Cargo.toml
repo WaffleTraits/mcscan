@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Fast multi-threaded Minecraft world inventory scanner / editor (finds and fixes illegal items)"
 license = "MIT"
+repository = "https://github.com/WaffleTraits/mcscan"
+readme = "README.md"
+keywords = ["minecraft", "nbt", "anvil", "scanner", "cli"]
+categories = ["command-line-utilities", "games"]
+exclude = ["/dist"]
 
 [dependencies]
 anyhow = "1"
