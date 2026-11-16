@@ -408,7 +408,15 @@ impl Preset {
 
         // --- components --------------------------------------------------------
         if let Some(comps) = v.comps {
-            for (k, _) in comps.iter() {
+            for (k, value) in comps.iter() {
+                // Named containers carried over from before 1.20.5 keep a
+                // `block_entity_data` holding nothing but the block id and the
+                // name. That is what the game's own upgrade leaves behind.
+                if norm_id(k) == "minecraft:block_entity_data"
+                    && value.as_compound().map_or(false, |c| c.iter().all(|(key, _)| matches!(key, "id" | "CustomName")))
+                {
+                    continue;
+                }
                 if let Some(base) = k.strip_prefix('!') {
                     push(
                         Rule::DeniedComponent,
@@ -645,7 +653,7 @@ mod tests {
     #[test]
     fn illegal_items_are_flagged() {
         let p = Preset::load("illegal").unwrap();
-        let cases: [(&str, &[&str]); 16] = [
+        let cases: [(&str, &[&str]); 18] = [
             (r#"{id:"minecraft:diamond_sword",count:1,components:{"minecraft:enchantments":{"minecraft:sharpness":255}}}"#, &["enchant_over_max"]),
             (r#"{id:"minecraft:diamond_sword",Count:1b,tag:{Enchantments:[{id:"minecraft:sharpness",lvl:32767s}]}}"#, &["enchant_over_max"]),
             (r#"{id:"minecraft:diamond_sword",count:1,components:{"minecraft:enchantments":{"minecraft:sharpness":5,"minecraft:smite":5}}}"#, &["enchant_conflict"]),
@@ -659,6 +667,16 @@ mod tests {
             (r#"{id:"minecraft:diamond_pickaxe",count:1,components:{"minecraft:unbreakable":{}}}"#, &["denied_component"]),
             (r#"{id:"minecraft:diamond_pickaxe",Count:1b,tag:{Unbreakable:1b}}"#, &["denied_component"]),
             (r#"{id:"minecraft:apple",count:1,components:{"!minecraft:food":{}}}"#, &["denied_component"]),
+            // A named shulker box upgraded from an old version is fine ...
+            (
+                r#"{id:"minecraft:gray_shulker_box",count:1,components:{"minecraft:block_entity_data":{id:"minecraft:shulker_box",CustomName:{text:"Glowstone"}}}}"#,
+                &[],
+            ),
+            // ... one that smuggles other block data is not.
+            (
+                r#"{id:"minecraft:chest",count:1,components:{"minecraft:block_entity_data":{id:"minecraft:chest",Lock:"x"}}}"#,
+                &["denied_component"],
+            ),
             (r#"{id:"minecraft:potion",count:1,components:{"minecraft:potion_contents":{custom_effects:[{id:"minecraft:instant_damage",amplifier:125b}]}}}"#, &["potion_illegal"]),
             (r#"{id:"minecraft:potion",count:1}"#, &["potion_illegal"]),
             (r#"{id:"minecraft:firework_rocket",count:1,components:{"minecraft:fireworks":{flight_duration:127b}}}"#, &["firework_flight"]),
