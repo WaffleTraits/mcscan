@@ -16,6 +16,7 @@ clap = { version = "4.5", features = ["derive", "wrap_help"] }
 # zlib-rs: pure-Rust inflate, about 1.5x faster than the default backend here.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 lz4_flex = "0.11"
+ratatui = "0.29"
 rayon = "1.10"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

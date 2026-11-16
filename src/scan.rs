@@ -5,6 +5,7 @@ use crate::filter::{EvalCtx, Filter};
 use crate::item::{self, own_path, ItemView, SegRef};
 use crate::nbt::{self, Compound};
 use crate::preset::Preset;
+use crate::progress::Eta;
 use crate::region::{self, Inflater, Region, CHUNKS_PER_REGION, SECTOR};
 use crate::results::{self, Header, ReasonRec, Record, FORMAT_VERSION};
 use crate::world::{self, Category, WorldFile};
@@ -40,15 +41,20 @@ pub struct ScanOptions {
     pub threads: Option<usize>,
 }
 
+/// Live counters of a running scan, shared with whatever displays progress.
 #[derive(Default)]
-struct Stats {
-    files_done: AtomicU64,
-    bytes_done: AtomicU64,
-    chunks: AtomicU64,
-    items: AtomicU64,
-    matches: AtomicU64,
-    errors: AtomicU64,
+pub struct Stats {
+    pub total_files: AtomicU64,
+    pub total_bytes: AtomicU64,
+    pub files_done: AtomicU64,
+    pub bytes_done: AtomicU64,
+    pub chunks: AtomicU64,
+    pub items: AtomicU64,
+    pub matches: AtomicU64,
+    pub errors: AtomicU64,
     first_errors: Mutex<Vec<String>>,
+    /// Set to make the workers stop early; `execute` then fails with "cancelled".
+    pub cancel: AtomicBool,
 }
 
 impl Stats {
@@ -167,20 +173,28 @@ fn scan_tree(root: &Compound, file: &WorldFile, chunk: Option<(i32, i32)>, opts:
     out
 }
 
-fn scan_region(file: &WorldFile, opts: &ScanOptions, stats: &Stats) -> Vec<Record> {
+/// Returns the findings and how many of the file's bytes were already
+/// credited to `stats.bytes_done` (chunk by chunk, so progress and the ETA
+/// move smoothly through big region files).
+fn scan_region(file: &WorldFile, opts: &ScanOptions, stats: &Stats) -> (Vec<Record>, u64) {
     let region = match Region::open(&file.path) {
         Ok(r) => r,
         Err(e) => {
             stats.error(format!("{}: {e:#}", file.rel));
-            return Vec::new();
+            return (Vec::new(), 0);
         }
     };
     if region.buf.len() < 2 * SECTOR {
-        return Vec::new(); // empty placeholder region
+        return (Vec::new(), 0); // empty placeholder region
     }
-    (0..CHUNKS_PER_REGION)
+    let share = file.size / CHUNKS_PER_REGION as u64;
+    let records = (0..CHUNKS_PER_REGION)
         .into_par_iter()
         .map(|idx| {
+            stats.bytes_done.fetch_add(share, Ordering::Relaxed);
+            if stats.cancel.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
             SCRATCH.with(|cell| {
                 let mut scratch = cell.borrow_mut();
                 let (inflater, buf) = &mut *scratch;
@@ -203,7 +217,8 @@ fn scan_region(file: &WorldFile, opts: &ScanOptions, stats: &Stats) -> Vec<Recor
         .reduce(Vec::new, |mut a, mut b| {
             a.append(&mut b);
             a
-        })
+        });
+    (records, share * CHUNKS_PER_REGION as u64)
 }
 
 fn scan_dat(file: &WorldFile, opts: &ScanOptions, stats: &Stats) -> Vec<Record> {
@@ -233,7 +248,7 @@ pub fn human_count(n: u64) -> String {
     out
 }
 
-fn human_bytes(n: u64) -> String {
+pub fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
     let mut u = 0;
@@ -248,7 +263,18 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-pub fn run(opts: ScanOptions) -> Result<()> {
+/// Everything decided before the first byte is read: which files, how much
+/// data, how many threads.
+pub struct Plan {
+    pub world: PathBuf,
+    files: Vec<WorldFile>,
+    pub total_files: u64,
+    pub total_bytes: u64,
+    pool: rayon::ThreadPool,
+    pub threads: usize,
+}
+
+pub fn plan(opts: &ScanOptions) -> Result<Plan> {
     if opts.preset.is_none() && opts.filters.is_empty() && !opts.all_items {
         bail!("nothing to search for: pass --preset, one or more --filter expressions, or --all-items");
     }
@@ -276,54 +302,51 @@ pub fn run(opts: ScanOptions) -> Result<()> {
     }
     let pool = builder.build().context("starting worker threads")?;
     let threads = pool.current_num_threads();
+    Ok(Plan { world, files, total_files, total_bytes, pool, threads })
+}
 
-    if !opts.quiet {
-        if let Some(pid) = world::lock_holder(&world) {
-            eprintln!(
-                "note: this world is open in a running game/server (pid {pid}). Scanning is safe, but\n      \
-                 changes still in memory are not on disk yet - run `save-all flush` first for an exact result."
-            );
-        }
-        eprintln!(
-            "Scanning {} ({} files, {}) with {threads} thread{}",
-            world.display(),
-            human_count(total_files),
-            human_bytes(total_bytes),
-            if threads == 1 { "" } else { "s" }
-        );
+pub struct ScanOutput {
+    pub header: Header,
+    pub records: Vec<Record>,
+    pub elapsed: Duration,
+    pub total_bytes: u64,
+    pub chunks: u64,
+    pub items: u64,
+    pub errors: u64,
+    pub first_errors: Vec<String>,
+}
+
+impl ScanOutput {
+    /// "Scanned 1,234 chunks and 567 item stacks in 0.45s (5.0 GiB/s)"
+    pub fn speed_line(&self) -> String {
+        let secs = self.elapsed.as_secs_f64().max(0.001);
+        format!(
+            "Scanned {} chunks and {} item stacks in {:.2}s ({}/s)",
+            human_count(self.chunks),
+            human_count(self.items),
+            secs,
+            human_bytes((self.total_bytes as f64 / secs) as u64),
+        )
     }
+}
 
-    let stats = Arc::new(Stats::default());
-    let done = Arc::new(AtomicBool::new(false));
-    let progress = if !opts.quiet && std::io::stderr().is_terminal() {
-        let (stats, done) = (stats.clone(), done.clone());
-        Some(std::thread::spawn(move || {
-            while !done.load(Ordering::Relaxed) {
-                eprint!(
-                    "\r  {:>3}%  {}/{} files  {} chunks  {} stacks  {} matches   ",
-                    stats.bytes_done.load(Ordering::Relaxed) * 100 / total_bytes.max(1),
-                    stats.files_done.load(Ordering::Relaxed),
-                    total_files,
-                    human_count(stats.chunks.load(Ordering::Relaxed)),
-                    human_count(stats.items.load(Ordering::Relaxed)),
-                    human_count(stats.matches.load(Ordering::Relaxed)),
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            eprint!("\r{:79}\r", "");
-        }))
-    } else {
-        None
-    };
-
+/// Run the scan. Progress is published through `stats` while it runs; nothing
+/// is printed and nothing is written.
+pub fn execute(plan: &Plan, opts: &ScanOptions, stats: &Stats) -> Result<ScanOutput> {
+    stats.total_files.store(plan.total_files, Ordering::Relaxed);
+    stats.total_bytes.store(plan.total_bytes, Ordering::Relaxed);
     let started = Instant::now();
-    let mut records: Vec<Record> = pool.install(|| {
-        files
+    let mut records: Vec<Record> = plan.pool.install(|| {
+        plan.files
             .par_iter()
             .map(|file| {
-                let found = if file.is_region() { scan_region(file, &opts, &stats) } else { scan_dat(file, &opts, &stats) };
+                if stats.cancel.load(Ordering::Relaxed) {
+                    return Vec::new();
+                }
+                let (found, credited) =
+                    if file.is_region() { scan_region(file, opts, stats) } else { (scan_dat(file, opts, stats), 0) };
                 stats.files_done.fetch_add(1, Ordering::Relaxed);
-                stats.bytes_done.fetch_add(file.size, Ordering::Relaxed);
+                stats.bytes_done.fetch_add(file.size - credited, Ordering::Relaxed);
                 found
             })
             .reduce(Vec::new, |mut a, mut b| {
@@ -332,9 +355,8 @@ pub fn run(opts: ScanOptions) -> Result<()> {
             })
     });
     let elapsed = started.elapsed();
-    done.store(true, Ordering::Relaxed);
-    if let Some(handle) = progress {
-        let _ = handle.join();
+    if stats.cancel.load(Ordering::Relaxed) {
+        bail!("scan cancelled");
     }
 
     // Deterministic numbering regardless of thread scheduling.
@@ -347,7 +369,7 @@ pub fn run(opts: ScanOptions) -> Result<()> {
 
     let header = Header {
         mcscan: FORMAT_VERSION,
-        world: world.to_string_lossy().into_owned(),
+        world: plan.world.to_string_lossy().into_owned(),
         preset: opts.preset_spec.clone(),
         filters: opts.filters.iter().map(|f| f.source.clone()).collect(),
         scanned_at: std::time::SystemTime::now()
@@ -357,41 +379,135 @@ pub fn run(opts: ScanOptions) -> Result<()> {
         items_scanned: stats.items.load(Ordering::Relaxed),
         matches: records.len() as u64,
     };
-    if opts.output == "-" {
-        results::write(std::io::BufWriter::new(std::io::stdout().lock()), &header, &records)?;
+    let first_errors = stats.first_errors.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Ok(ScanOutput {
+        header,
+        records,
+        elapsed,
+        total_bytes: plan.total_bytes,
+        chunks: stats.chunks.load(Ordering::Relaxed),
+        items: stats.items.load(Ordering::Relaxed),
+        errors: stats.errors.load(Ordering::Relaxed),
+        first_errors,
+    })
+}
+
+/// Write a results file (`-` = standard output).
+pub fn save(output: &str, header: &Header, records: &[Record]) -> Result<()> {
+    if output == "-" {
+        results::write(std::io::BufWriter::new(std::io::stdout().lock()), header, records)
     } else {
-        let f = std::fs::File::create(&opts.output).with_context(|| format!("creating {}", opts.output))?;
-        results::write(std::io::BufWriter::new(f), &header, &records)?;
+        let f = std::fs::File::create(output).with_context(|| format!("creating {output}"))?;
+        results::write(std::io::BufWriter::new(f), header, records)
+    }
+}
+
+/// One line of progress for a plain terminal, with rate and time remaining.
+fn progress_line(stats: &Stats, eta: &Eta) -> String {
+    let total = stats.total_bytes.load(Ordering::Relaxed);
+    let done = stats.bytes_done.load(Ordering::Relaxed).min(total);
+    format!(
+        "  {:>3}%  {}/{} files  {} chunks  {} matches  {}/s  ETA {}",
+        done * 100 / total.max(1),
+        stats.files_done.load(Ordering::Relaxed),
+        stats.total_files.load(Ordering::Relaxed),
+        human_count(stats.chunks.load(Ordering::Relaxed)),
+        human_count(stats.matches.load(Ordering::Relaxed)),
+        human_bytes(eta.rate() as u64),
+        eta.text(total),
+    )
+}
+
+/// `mcscan scan`: scan, show progress on stderr, write the results file.
+pub fn run(opts: ScanOptions) -> Result<()> {
+    let plan = plan(&opts)?;
+    if !opts.quiet {
+        if let Some(pid) = world::lock_holder(&plan.world) {
+            eprintln!(
+                "note: this world is open in a running game/server (pid {pid}). Scanning is safe, but\n      \
+                 changes still in memory are not on disk yet - run `save-all flush` first for an exact result."
+            );
+        }
+        eprintln!(
+            "Scanning {} ({} files, {}) with {} thread{}",
+            plan.world.display(),
+            human_count(plan.total_files),
+            human_bytes(plan.total_bytes),
+            plan.threads,
+            if plan.threads == 1 { "" } else { "s" }
+        );
     }
 
+    let stats = Arc::new(Stats::default());
+    let done = Arc::new(AtomicBool::new(false));
+    let progress = if !opts.quiet && std::io::stderr().is_terminal() {
+        let (stats, done) = (stats.clone(), done.clone());
+        Some(std::thread::spawn(move || {
+            let mut eta = Eta::new();
+            while !done.load(Ordering::Relaxed) {
+                eta.update(stats.bytes_done.load(Ordering::Relaxed));
+                // \x1b[K clears whatever a longer previous line left behind.
+                eprint!("\r{}\x1b[K", progress_line(&stats, &eta));
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            eprint!("\r\x1b[K");
+        }))
+    } else {
+        None
+    };
+
+    let result = execute(&plan, &opts, &stats);
+    done.store(true, Ordering::Relaxed);
+    if let Some(handle) = progress {
+        let _ = handle.join();
+    }
+    let out = result?;
+    save(&opts.output, &out.header, &out.records)?;
+
     if !opts.quiet {
-        let secs = elapsed.as_secs_f64().max(0.001);
-        eprintln!(
-            "Scanned {} chunks and {} item stacks in {:.2}s ({}/s)",
-            human_count(stats.chunks.load(Ordering::Relaxed)),
-            human_count(stats.items.load(Ordering::Relaxed)),
-            secs,
-            human_bytes((total_bytes as f64 / secs) as u64),
-        );
-        let errors = stats.errors.load(Ordering::Relaxed);
-        if errors > 0 {
-            eprintln!("warning: {} chunk(s)/file(s) could not be read and were skipped:", human_count(errors));
-            let list = stats.first_errors.lock().unwrap_or_else(|e| e.into_inner());
-            for e in list.iter() {
+        eprintln!("{}", out.speed_line());
+        if out.errors > 0 {
+            eprintln!("warning: {} chunk(s)/file(s) could not be read and were skipped:", human_count(out.errors));
+            for e in &out.first_errors {
                 eprintln!("  {e}");
             }
-            if errors as usize > list.len() {
-                eprintln!("  ... and {} more", errors as usize - list.len());
+            if out.errors as usize > out.first_errors.len() {
+                eprintln!("  ... and {} more", out.errors as usize - out.first_errors.len());
             }
         }
-        let refs: Vec<&Record> = records.iter().collect();
+        let refs: Vec<&Record> = out.records.iter().collect();
         results::print_summary(std::io::stderr().lock(), &refs)?;
         if opts.output != "-" {
             eprintln!("Results written to {}", opts.output);
-            if !records.is_empty() {
-                eprintln!("Next:  mcscan list {0}      then      mcscan apply {0} --all --fix --dry-run", opts.output);
+            if !out.records.is_empty() {
+                eprintln!(
+                    "Next:  mcscan list {0}      then      mcscan apply {0} --all --fix --dry-run      (or: mcscan tui {0})",
+                    opts.output
+                );
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_line_shows_rate_and_eta() {
+        let stats = Stats::default();
+        stats.total_bytes.store(1000 << 20, Ordering::Relaxed);
+        stats.total_files.store(10, Ordering::Relaxed);
+        stats.bytes_done.store(250 << 20, Ordering::Relaxed);
+        stats.files_done.store(2, Ordering::Relaxed);
+        let t = Instant::now();
+        let mut eta = Eta::starting_at(t);
+        eta.update_at(t + Duration::from_secs(5), 250 << 20);
+        let line = progress_line(&stats, &eta);
+        assert!(line.contains(" 25%"), "{line}");
+        assert!(line.contains("2/10 files"), "{line}");
+        assert!(line.contains("50.0 MiB/s"), "{line}");
+        assert!(line.ends_with("ETA 15s"), "{line}");
+    }
 }

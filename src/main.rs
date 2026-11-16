@@ -10,9 +10,11 @@ mod filter;
 mod item;
 mod nbt;
 mod preset;
+mod progress;
 mod region;
 mod results;
 mod scan;
+mod tui;
 mod world;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -26,6 +28,9 @@ Typical session:
   mcscan list mcscan-results.jsonl                          # 2. review
   mcscan apply mcscan-results.jsonl --all --fix --dry-run   # 3. preview
   mcscan apply mcscan-results.jsonl --all --fix             # 4. do it (server stopped)
+
+Or do all of it in one full-screen session:
+  mcscan tui /srv/minecraft/world
 
 Run `mcscan <command> --help` for details, `mcscan fields` for the filter
 language and `mcscan rules` for what the illegal-item preset checks.";
@@ -47,13 +52,20 @@ enum Command {
     Show(ShowArgs),
     /// Step 2: delete or modify selected findings in the world
     Apply(ApplyArgs),
+    /// Full-screen interface: scan, browse, select and fix in one place
+    #[command(long_about = "Full-screen interface: scan, browse, select and fix in one place.\n\n\
+        Give it a world folder to scan it (with the illegal preset unless you pass --preset, --filter or \
+        --all-items), or a results file written by `scan` to review that. Everything works from the \
+        keyboard; the mouse can click rows, column headers and buttons and scroll lists. Press ? inside \
+        for the keys.")]
+    Tui(TuiArgs),
     /// Describe the rules of a preset
     Rules(RulesArgs),
     /// Describe the --filter expression language
     Fields,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct ScanArgs {
     /// World folder (the one containing level.dat)
     world: PathBuf,
@@ -198,6 +210,21 @@ struct ApplyArgs {
 }
 
 #[derive(Args)]
+struct TuiArgs {
+    #[command(flatten)]
+    scan: ScanArgs,
+    /// Start with mouse support off (press m inside to toggle; off lets the terminal select text)
+    #[arg(long)]
+    no_mouse: bool,
+    /// Do not copy modified files to <world>/mcscan-backups/ first
+    #[arg(long)]
+    no_backup: bool,
+    /// Allow modifying a world that a server/game has open (dangerous)
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args)]
 struct RulesArgs {
     /// Preset to describe
     #[arg(short, long, value_name = "NAME|FILE", default_value = "illegal")]
@@ -211,7 +238,7 @@ fn parse_rule(name: &str) -> Result<preset::Rule> {
     })
 }
 
-fn scan_cmd(a: ScanArgs) -> Result<()> {
+fn build_scan(a: &ScanArgs) -> Result<scan::ScanOptions> {
     let preset_spec = a.preset.clone();
     let preset = match &a.preset {
         Some(spec) => {
@@ -255,18 +282,66 @@ fn scan_cmd(a: ScanArgs) -> Result<()> {
             })
             .collect::<Result<Vec<_>>>()?
     };
-    scan::run(scan::ScanOptions {
-        world: a.world,
+    Ok(scan::ScanOptions {
+        world: a.world.clone(),
         preset,
         preset_spec,
         filters,
         all_items: a.all_items,
         categories,
-        dims: a.dim,
-        output: a.output,
+        dims: a.dim.clone(),
+        output: a.output.clone(),
         snbt: a.snbt,
         quiet: a.quiet,
         threads: a.threads,
+    })
+}
+
+fn scan_cmd(a: ScanArgs) -> Result<()> {
+    scan::run(build_scan(&a)?)
+}
+
+fn tui_cmd(a: TuiArgs) -> Result<()> {
+    let mut args = a.scan.clone();
+    let asked_for_something = args.preset.is_some() || !args.filters.is_empty() || args.all_items;
+    let loaded = if args.world.is_file() {
+        // A results file: review it. A rescan repeats what its header records
+        // unless the command line says otherwise.
+        let path = args.world.to_string_lossy().into_owned();
+        let (header, records) = results::load(&path)?;
+        args.world = PathBuf::from(&header.world);
+        args.output = path;
+        if !asked_for_something {
+            args.preset = header.preset.clone();
+            args.filters = header.filters.clone();
+            args.all_items = args.preset.is_none() && args.filters.is_empty();
+        }
+        Some((header, records))
+    } else {
+        if !args.world.is_dir() {
+            bail!("{} is neither a world folder nor a results file", args.world.display());
+        }
+        if args.output == "-" {
+            bail!("the TUI needs a real results file, not -o -");
+        }
+        if !asked_for_something {
+            args.preset = Some("illegal".to_string());
+        }
+        build_scan(&args)?; // report bad options before the screen is taken over
+        None
+    };
+    let threads = args.threads;
+    let results_path = args.output.clone();
+    let world = args.world.clone();
+    tui::run(tui::Config {
+        make_scan: std::sync::Arc::new(move || build_scan(&args)),
+        results_path,
+        world,
+        loaded,
+        mouse: !a.no_mouse,
+        backup: !a.no_backup,
+        force: a.force,
+        threads,
     })
 }
 
@@ -330,6 +405,32 @@ fn component_arg(s: &str) -> String {
     }
 }
 
+fn check_count(n: i64) -> Result<()> {
+    if !(1..=99).contains(&n) {
+        bail!("the stack size must be between 1 and 99 (delete the item to remove it)");
+    }
+    Ok(())
+}
+
+/// "sharpness=5"
+fn parse_set_enchant(s: &str) -> Result<(String, i64)> {
+    let (name, level) = split_assignment(s, "set-enchant")?;
+    let level: i64 = level.trim().parse().with_context(|| format!("set-enchant {s:?}: level is not a number"))?;
+    if !(1..=255).contains(&level) {
+        bail!("set-enchant {s:?}: the game only accepts levels 1-255");
+    }
+    Ok((item::norm_id(name.trim()).into_owned(), level))
+}
+
+/// "components.minecraft:damage=0"
+fn parse_set(s: &str) -> Result<(Vec<nbt::Seg>, nbt::Tag)> {
+    let (path, value) = split_assignment(s, "set")?;
+    Ok((
+        nbt::parse_path(path.trim())?,
+        nbt::parse_snbt(value).with_context(|| format!("set {s:?}: value is not valid SNBT"))?,
+    ))
+}
+
 fn apply_cmd(a: ApplyArgs) -> Result<()> {
     let (header, records) = results::load(&a.results)?;
     require_selection(&a.select, "apply to")?;
@@ -347,24 +448,13 @@ fn apply_cmd(a: ApplyArgs) -> Result<()> {
         ..Default::default()
     };
     if let Some(n) = ops.set_count {
-        if !(1..=99).contains(&n) {
-            bail!("--set-count must be between 1 and 99 (use --delete to remove items)");
-        }
+        check_count(n)?;
     }
     for s in &a.set_enchant {
-        let (name, level) = split_assignment(s, "--set-enchant")?;
-        let level: i64 = level.trim().parse().with_context(|| format!("--set-enchant {s:?}: level is not a number"))?;
-        if !(1..=255).contains(&level) {
-            bail!("--set-enchant {s:?}: the game only accepts levels 1-255");
-        }
-        ops.set_enchant.push((item::norm_id(name.trim()).into_owned(), level));
+        ops.set_enchant.push(parse_set_enchant(s)?);
     }
     for s in &a.set {
-        let (path, value) = split_assignment(s, "--set")?;
-        ops.set.push((
-            nbt::parse_path(path.trim())?,
-            nbt::parse_snbt(value).with_context(|| format!("--set {s:?}: value is not valid SNBT"))?,
-        ));
+        ops.set.push(parse_set(s)?);
     }
     for s in &a.remove {
         ops.remove.push(nbt::parse_path(s.trim())?);
@@ -424,12 +514,19 @@ fn rules(a: RulesArgs) -> Result<()> {
 }
 
 fn main() {
+    // Die quietly, like other command-line tools, when the reader of a pipe
+    // goes away (`mcscan show ... | head`) instead of panicking in println!.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Scan(a) => scan_cmd(a),
         Command::List(a) => list(a),
         Command::Show(a) => show(a),
         Command::Apply(a) => apply_cmd(a),
+        Command::Tui(a) => tui_cmd(a),
         Command::Rules(a) => rules(a),
         Command::Fields => {
             println!("{}", filter::HELP);

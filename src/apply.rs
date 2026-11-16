@@ -16,6 +16,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// What to do to each selected item. Operations run in the order listed here.
 #[derive(Default, Debug, Clone)]
@@ -350,9 +352,69 @@ fn timestamp() -> String {
     format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
+/// Live counters of a running `execute`, for progress displays.
+#[derive(Default)]
+pub struct Progress {
+    pub files_total: AtomicU64,
+    pub files_done: AtomicU64,
+}
+
+/// What `execute` did (or, for a dry run, would do).
+pub struct Report {
+    pub outcomes: Vec<Outcome>,
+    pub dry_run: bool,
+    pub files: usize,
+    /// Where the originals went, if anything was backed up.
+    pub backup_dir: Option<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
+impl Report {
+    /// (changed, deleted, already fine, skipped)
+    pub fn counts(&self) -> (usize, usize, usize, usize) {
+        let mut c = (0, 0, 0, 0);
+        for o in &self.outcomes {
+            match o.status {
+                Status::Changed => c.0 += 1,
+                Status::Deleted => c.1 += 1,
+                Status::Unchanged => c.2 += 1,
+                Status::Skipped(_) => c.3 += 1,
+            }
+        }
+        c
+    }
+
+    pub fn summary(&self) -> String {
+        let (changed, deleted, unchanged, skips) = self.counts();
+        let prefix = if self.dry_run { "DRY RUN - nothing was written. Would have: " } else { "Done: " };
+        format!("{prefix}{changed} changed, {deleted} deleted, {unchanged} already fine, {skips} skipped.")
+    }
+}
+
+impl Outcome {
+    /// "#12    would delete  bedrock  [chest @ overworld 1 2 3 slot 0]  deleted"
+    pub fn line(&self, rec: &Record, dry_run: bool) -> String {
+        let verb = match (&self.status, dry_run) {
+            (Status::Changed, true) => "would change",
+            (Status::Changed, false) => "changed",
+            (Status::Deleted, true) => "would delete",
+            (Status::Deleted, false) => "deleted",
+            (Status::Unchanged, _) => "nothing to do",
+            (Status::Skipped(_), _) => "SKIPPED",
+        };
+        let detail = match &self.status {
+            Status::Skipped(why) => why.clone(),
+            _ => self.notes.join("; "),
+        };
+        format!("#{:<5} {:<13} {}  [{}]  {}", self.n, verb, rec.item_text(), rec.location(), detail)
+    }
+}
+
 struct Run<'a> {
     opts: &'a ApplyOptions,
     backup_dir: Option<PathBuf>,
+    progress: &'a Progress,
+    warnings: Mutex<Vec<String>>,
 }
 
 impl Run<'_> {
@@ -427,7 +489,10 @@ impl Run<'_> {
             drop(region);
             let dropped = region::rewrite(&path, &replace)?;
             if dropped > 0 {
-                eprintln!("warning: {rel}: {dropped} chunk(s) were already unreadable and have been dropped");
+                self.warnings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(format!("{rel}: {dropped} chunk(s) were already unreadable and have been dropped"));
             }
         }
         Ok(outcomes)
@@ -448,6 +513,7 @@ impl Run<'_> {
 
     fn file(&self, rel: &str, recs: &[&Record]) -> Vec<Outcome> {
         let result = if rel.ends_with(".mca") { self.region(rel, recs) } else { self.dat(rel, recs) };
+        self.progress.files_done.fetch_add(1, Ordering::Relaxed);
         result.unwrap_or_else(|e| recs.iter().map(|r| skipped(r, format!("{rel}: {e:#}"))).collect())
     }
 }
@@ -492,6 +558,62 @@ fn pick_interactively<'a>(selected: Vec<&'a Record>, what: &str) -> Result<Vec<&
     Ok(keep)
 }
 
+/// Refuse to write to a world a game/server has open. With `--force` the pid
+/// is returned instead so the caller can warn.
+pub fn ensure_unlocked(opts: &ApplyOptions) -> Result<Option<i64>> {
+    match crate::world::lock_holder(&opts.world) {
+        Some(pid) if !opts.force => bail!(
+            "this world is open in a running game/server (pid {pid}). Stop it first: the server would \
+             overwrite the changes and can corrupt chunks it has loaded. (--force overrides; a dry run is always safe)"
+        ),
+        other => Ok(other),
+    }
+}
+
+/// Apply the operations to the selected findings. Nothing is printed and
+/// nobody is asked; progress is published through `progress`.
+pub fn execute(opts: &ApplyOptions, selected: &[&Record], progress: &Progress) -> Result<Report> {
+    if opts.ops.is_empty() {
+        bail!("no action given");
+    }
+    if !opts.world.is_dir() {
+        bail!("world folder {} not found (use --world if it has moved since the scan)", opts.world.display());
+    }
+    if !opts.dry_run {
+        ensure_unlocked(opts)?;
+    }
+    let mut by_file: BTreeMap<&str, Vec<&Record>> = BTreeMap::new();
+    for &rec in selected {
+        by_file.entry(rec.file.as_str()).or_default().push(rec);
+    }
+    progress.files_total.store(by_file.len() as u64, Ordering::Relaxed);
+
+    let backup_dir = if opts.backup && !opts.dry_run {
+        Some(opts.world.join("mcscan-backups").join(timestamp()))
+    } else {
+        None
+    };
+    let run = Run { opts, backup_dir: backup_dir.clone(), progress, warnings: Mutex::new(Vec::new()) };
+
+    let mut builder = rayon::ThreadPoolBuilder::new();
+    if let Some(n) = opts.threads {
+        builder = builder.num_threads(n.max(1));
+    }
+    let pool = builder.build().context("starting worker threads")?;
+    let groups: Vec<(&str, Vec<&Record>)> = by_file.into_iter().collect();
+    let mut outcomes: Vec<Outcome> =
+        pool.install(|| groups.par_iter().flat_map_iter(|(rel, recs)| run.file(rel, recs)).collect());
+    outcomes.sort_by_key(|o| o.n);
+    Ok(Report {
+        outcomes,
+        dry_run: opts.dry_run,
+        files: groups.len(),
+        backup_dir: backup_dir.filter(|d| d.exists()),
+        warnings: run.warnings.into_inner().unwrap_or_else(|e| e.into_inner()),
+    })
+}
+
+/// `mcscan apply`: confirm, execute, print what happened.
 pub fn run(opts: ApplyOptions, selected: Vec<&Record>) -> Result<()> {
     if opts.ops.is_empty() {
         bail!(
@@ -513,23 +635,13 @@ pub fn run(opts: ApplyOptions, selected: Vec<&Record>) -> Result<()> {
         return Ok(());
     }
 
-    let mut by_file: BTreeMap<&str, Vec<&Record>> = BTreeMap::new();
-    for &rec in &selected {
-        by_file.entry(rec.file.as_str()).or_default().push(rec);
-    }
-
     if !opts.dry_run {
-        if let Some(pid) = world_lock(&opts.world) {
-            if !opts.force {
-                bail!(
-                    "this world is open in a running game/server (pid {pid}). Stop it first: the server would \
-                     overwrite the changes and can corrupt chunks it has loaded. (--force overrides; --dry-run is always safe)"
-                );
-            }
+        if let Some(pid) = ensure_unlocked(&opts)? {
             eprintln!("warning: world is in use by pid {pid}; continuing because of --force");
         }
         if !opts.yes && !opts.interactive {
-            eprintln!("About to {action} on {} item stack(s) in {} file(s) under {}", selected.len(), by_file.len(), opts.world.display());
+            let files: HashSet<&str> = selected.iter().map(|r| r.file.as_str()).collect();
+            eprintln!("About to {action} on {} item stack(s) in {} file(s) under {}", selected.len(), files.len(), opts.world.display());
             if !std::io::stdin().is_terminal() {
                 bail!("refusing to modify the world without confirmation: pass --yes (or try --dry-run)");
             }
@@ -540,58 +652,24 @@ pub fn run(opts: ApplyOptions, selected: Vec<&Record>) -> Result<()> {
         }
     }
 
-    let backup_dir = if opts.backup && !opts.dry_run {
-        Some(opts.world.join("mcscan-backups").join(timestamp()))
-    } else {
-        None
-    };
-    let run = Run { opts: &opts, backup_dir: backup_dir.clone() };
-
-    let mut builder = rayon::ThreadPoolBuilder::new();
-    if let Some(n) = opts.threads {
-        builder = builder.num_threads(n.max(1));
+    let report = execute(&opts, &selected, &Progress::default())?;
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
     }
-    let pool = builder.build().context("starting worker threads")?;
-    let groups: Vec<(&str, Vec<&Record>)> = by_file.into_iter().collect();
-    let mut outcomes: Vec<Outcome> =
-        pool.install(|| groups.par_iter().flat_map_iter(|(rel, recs)| run.file(rel, recs)).collect());
-    outcomes.sort_by_key(|o| o.n);
 
     let by_n: HashMap<u64, &Record> = selected.iter().map(|r| (r.n, *r)).collect();
-    let (mut changed, mut deleted, mut unchanged, mut skips) = (0, 0, 0, 0);
     let stdout = std::io::stdout();
     let mut w = std::io::BufWriter::new(stdout.lock());
-    for o in &outcomes {
-        let Some(rec) = by_n.get(&o.n) else { continue };
-        let verb = match &o.status {
-            Status::Changed => {
-                changed += 1;
-                if opts.dry_run { "would change" } else { "changed" }
-            }
-            Status::Deleted => {
-                deleted += 1;
-                if opts.dry_run { "would delete" } else { "deleted" }
-            }
-            Status::Unchanged => {
-                unchanged += 1;
-                "nothing to do"
-            }
-            Status::Skipped(_) => {
-                skips += 1;
-                "SKIPPED"
-            }
-        };
-        let detail = match &o.status {
-            Status::Skipped(why) => why.clone(),
-            _ => o.notes.join("; "),
-        };
-        writeln!(w, "#{:<5} {:<13} {}  [{}]  {}", o.n, verb, rec.item_text(), rec.location(), detail)?;
+    for o in &report.outcomes {
+        if let Some(rec) = by_n.get(&o.n) {
+            writeln!(w, "{}", o.line(rec, opts.dry_run))?;
+        }
     }
     writeln!(w)?;
-    let prefix = if opts.dry_run { "DRY RUN - nothing was written. Would have: " } else { "Done: " };
-    writeln!(w, "{prefix}{changed} changed, {deleted} deleted, {unchanged} already fine, {skips} skipped.")?;
-    if let Some(dir) = backup_dir {
-        if changed + deleted > 0 && dir.exists() {
+    writeln!(w, "{}", report.summary())?;
+    let (changed, deleted, _, skips) = report.counts();
+    if let Some(dir) = &report.backup_dir {
+        if changed + deleted > 0 {
             writeln!(w, "Originals of every modified file are in {}", dir.display())?;
         }
     }
@@ -602,8 +680,32 @@ pub fn run(opts: ApplyOptions, selected: Vec<&Record>) -> Result<()> {
     Ok(())
 }
 
-fn world_lock(world: &Path) -> Option<i64> {
-    crate::world::lock_holder(world)
+/// The current on-disk state of a finding.
+pub enum Live {
+    /// The item, and whether it still matches the scan's fingerprint.
+    Item { item: Compound, unchanged: bool },
+    ChunkGone,
+    ItemGone,
+}
+
+pub fn load_item(world: &Path, rec: &Record, inflater: &mut Inflater, buf: &mut Vec<u8>) -> Result<Live> {
+    let path = world.join(&rec.file);
+    let root = if rec.file.ends_with(".mca") {
+        let region = Region::open(&path)?;
+        let [cx, cz] = rec.chunk.ok_or_else(|| anyhow!("finding #{} has no chunk position", rec.n))?;
+        if !region.read(region::chunk_index(cx, cz), inflater, buf)? {
+            return Ok(Live::ChunkGone);
+        }
+        nbt::parse(buf)?.1
+    } else {
+        nbt::parse(&region::read_dat(&path)?.0)?.1
+    };
+    Ok(match nbt::get_path(&root, &rec.path) {
+        Some(Tag::Compound(c)) => {
+            Live::Item { item: c.clone(), unchanged: format!("{:016x}", nbt::fingerprint(c)) == rec.hash }
+        }
+        _ => Live::ItemGone,
+    })
 }
 
 /// `mcscan show`: print the current on-disk NBT of the selected findings.
@@ -617,38 +719,27 @@ pub fn show(world: &Path, selected: &[&Record], pretty: bool) -> Result<()> {
         if !rec.reasons.is_empty() {
             println!("  why:  {}", rec.why());
         }
-        let path = world.join(&rec.file);
-        let root = if rec.file.ends_with(".mca") {
-            let region = Region::open(&path)?;
-            let [cx, cz] = rec.chunk.ok_or_else(|| anyhow!("finding #{} has no chunk position", rec.n))?;
-            if !region.read(region::chunk_index(cx, cz), &mut inflater, &mut buf)? {
-                println!("  (chunk no longer exists)\n");
-                continue;
-            }
-            nbt::parse(&buf)?.1
-        } else {
-            nbt::parse(&region::read_dat(&path)?.0)?.1
-        };
-        match nbt::get_path(&root, &rec.path) {
-            Some(Tag::Compound(c)) => {
-                if format!("{:016x}", nbt::fingerprint(c)) != rec.hash {
+        match load_item(world, rec, &mut inflater, &mut buf)? {
+            Live::ChunkGone => println!("  (chunk no longer exists)\n"),
+            Live::ItemGone => println!("  (item is no longer there)\n"),
+            Live::Item { item, unchanged } => {
+                if !unchanged {
                     println!("  note: the item has changed since the scan");
                 }
                 if pretty {
                     let mut s = String::new();
-                    pretty_snbt(&Tag::Compound(c.clone()), 1, &mut s);
+                    pretty_snbt(&Tag::Compound(item), 1, &mut s);
                     println!("  {s}\n");
                 } else {
-                    println!("  {}\n", nbt::snbt(c));
+                    println!("  {}\n", nbt::snbt(&item));
                 }
             }
-            _ => println!("  (item is no longer there)\n"),
         }
     }
     Ok(())
 }
 
-fn pretty_snbt(tag: &Tag, depth: usize, out: &mut String) {
+pub fn pretty_snbt(tag: &Tag, depth: usize, out: &mut String) {
     let indent = "  ".repeat(depth + 1);
     match tag {
         Tag::Compound(c) if !c.is_empty() => {

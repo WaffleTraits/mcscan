@@ -50,13 +50,52 @@ Prebuilt x86-64 binaries are in `dist/`:
 Building on the machine that will run it is the best option:
 `cargo build --release` there gives the fast build with no glibc concerns.
 
+## Full-screen mode
+
+```sh
+mcscan tui /srv/minecraft/world          # scan, then browse and fix
+mcscan tui mcscan-results.jsonl          # review an earlier scan
+```
+
+One session for the whole flow. Given a world it scans it (with the
+`illegal` preset unless you pass `--preset`, `--filter` or `--all-items`; the
+other `scan` options work too), showing a progress bar, speed and the time
+left. The findings then appear in a list you can filter, sort and tick, and
+every action is first run as a dry run and shown as a preview — nothing is
+written until you confirm that preview. The scan is also saved to the results
+file, so the commands below keep working on it.
+
+| key | does |
+| --- | --- |
+| `↑` `↓` `PgUp` `PgDn` `Home` `End` (or `j` `k` `g` `G`) | move |
+| `Space`, `a`, `n`, `i` | select current / all shown / none / invert |
+| `Enter` | full details and the item's current NBT on disk |
+| `/` | filter: words that must all appear (item, place, rule, file) |
+| `s`, `S` | next sort column, reverse |
+| `f`, `d` | fix / delete the selection (or the current finding if none is selected) |
+| `e` | more actions: clamp or strip enchantments, set count, set/remove NBT, … |
+| `r` | rescan |
+| `m` | mouse support on/off |
+| `?`, `q` | help, quit |
+
+The mouse is optional. With it on (the default), click a row to move to it,
+its `[ ]` box or right-click to select it, double-click for details, a column
+header to sort, any button along the bottom or in a popup instead of pressing
+its key, and use the wheel to scroll. Press `m` (or start with `--no-mouse`)
+to turn it off, which gives the terminal's own text selection back.
+
+The same safety rules as `apply` hold: changes are refused while a game or
+server has the world open (`--force` overrides), items that changed since the
+scan are skipped, and modified files are backed up first (`--no-backup`).
+
 ## Step 1 — scan
 
 ```sh
 mcscan scan /srv/minecraft/world --preset illegal
 ```
 
-writes `mcscan-results.jsonl` and prints a summary. Useful options:
+writes `mcscan-results.jsonl` and prints a summary. While it runs, a progress
+line shows percent done, speed and the estimated time left. Useful options:
 
 | option | meaning |
 | --- | --- |
