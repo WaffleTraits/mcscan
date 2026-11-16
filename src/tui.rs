@@ -46,6 +46,7 @@ pub struct Config {
     /// Findings to start with; `None` scans first.
     pub loaded: Option<(Header, Vec<Record>)>,
     pub mouse: bool,
+    pub theme: ThemeName,
     pub backup: bool,
     pub force: bool,
     pub threads: Option<usize>,
@@ -249,6 +250,141 @@ struct Cols {
 
 const CHECK_W: usize = 4; // "[x] "
 
+// ---------------------------------------------------------------------------
+// Themes
+// ---------------------------------------------------------------------------
+
+/// Colour scheme of the full-screen interface.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
+pub enum ThemeName {
+    /// The terminal's own background and text colours
+    #[default]
+    Default,
+    /// Midnight Commander: blue panel, cyan bars, grey dialogs
+    #[value(alias = "midnight-commander")]
+    Mc,
+}
+
+impl ThemeName {
+    fn next(self) -> Self {
+        match self {
+            ThemeName::Default => ThemeName::Mc,
+            ThemeName::Mc => ThemeName::Default,
+        }
+    }
+
+    fn flag(self) -> &'static str {
+        match self {
+            ThemeName::Default => "default",
+            ThemeName::Mc => "mc",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ThemeName::Default => "default",
+            ThemeName::Mc => "Midnight Commander",
+        }
+    }
+
+    fn theme(self) -> Theme {
+        let s = Style::new();
+        match self {
+            ThemeName::Default => {
+                let p = Palette {
+                    base: s,
+                    label: s.fg(Color::Cyan),
+                    dim: s.fg(Color::DarkGray),
+                    error: s.fg(Color::Red),
+                    accent: s.fg(Color::Yellow),
+                    hotkey: s.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    border: s.fg(Color::Cyan),
+                    gauge: s.fg(Color::Cyan).bg(Color::DarkGray),
+                    cursor: None,
+                };
+                Theme {
+                    main: Palette { border: s, ..p },
+                    popup: p,
+                    title: s.fg(Color::Black).bg(Color::Cyan),
+                    key: s.fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    key_label: s,
+                    head: s.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    mark: s.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                }
+            }
+            ThemeName::Mc => {
+                let cursor = Some(s.fg(Color::Black).bg(Color::Cyan));
+                Theme {
+                    main: Palette {
+                        base: s.fg(Color::Gray).bg(Color::Blue),
+                        label: s.fg(Color::LightCyan),
+                        dim: s.fg(Color::Cyan),
+                        error: s.fg(Color::LightRed),
+                        accent: s.fg(Color::Yellow),
+                        hotkey: s.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        border: s.fg(Color::Gray),
+                        gauge: s.fg(Color::Cyan).bg(Color::Black),
+                        cursor,
+                    },
+                    popup: Palette {
+                        base: s.fg(Color::Black).bg(Color::Gray),
+                        label: s.fg(Color::Blue),
+                        dim: s.fg(Color::DarkGray),
+                        error: s.fg(Color::Red),
+                        accent: s.fg(Color::Blue),
+                        hotkey: s.fg(Color::Blue).add_modifier(Modifier::BOLD),
+                        border: s.fg(Color::Black),
+                        gauge: s.fg(Color::Blue).bg(Color::White),
+                        cursor,
+                    },
+                    title: s.fg(Color::Black).bg(Color::Cyan),
+                    key: s.fg(Color::White).bg(Color::Black),
+                    key_label: s.fg(Color::Black).bg(Color::Cyan),
+                    head: s.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    mark: s.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                }
+            }
+        }
+    }
+}
+
+/// Colours for one surface: the main screen, or a popup on top of it.
+#[derive(Clone, Copy)]
+struct Palette {
+    /// Background and ordinary text; empty leaves the terminal's own.
+    base: Style,
+    label: Style,
+    dim: Style,
+    error: Style,
+    accent: Style,
+    hotkey: Style,
+    border: Style,
+    gauge: Style,
+    /// The highlighted row; `None` reverses whatever the row looks like.
+    cursor: Option<Style>,
+}
+
+impl Palette {
+    fn cursor(&self, row: Style) -> Style {
+        match self.cursor {
+            Some(c) => row.patch(c),
+            None => row.add_modifier(Modifier::REVERSED),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Theme {
+    main: Palette,
+    popup: Palette,
+    title: Style,
+    key: Style,
+    key_label: Style,
+    head: Style,
+    /// A ticked row's checkbox.
+    mark: Style,
+}
+
 struct App {
     cfg: Config,
     header: Option<Header>,
@@ -267,6 +403,7 @@ struct App {
     sort_desc: bool,
     mode: Mode,
     mouse: bool,
+    theme: ThemeName,
     /// Whether to really switch the terminal's mouse reporting (off in tests).
     control_terminal: bool,
     hits: Vec<(Rect, Hit)>,
@@ -288,6 +425,7 @@ impl App {
         let mut app = App {
             world: cfg.world.clone(),
             mouse: cfg.mouse,
+            theme: cfg.theme,
             cfg,
             header: None,
             records: Arc::new(Vec::new()),
@@ -617,6 +755,7 @@ Other
   c                   what the last scan looked into (blocks, entities, players)
   r                   rescan the world
   m                   mouse support on/off (off lets the terminal select text)
+  t                   switch theme: default / Midnight Commander
   ?                   this help              q, Ctrl-C   quit
 
 Changes are refused while a game or server has the world open, items that
@@ -866,6 +1005,10 @@ changed since the scan are skipped, and modified files are backed up to
                     "Mouse support off - the terminal's own text selection works again.".to_string()
                 };
             }
+            KeyCode::Char('t') => {
+                self.theme = self.theme.next();
+                self.status = format!("Theme: {} (start with --theme {} to keep it).", self.theme.label(), self.theme.flag());
+            }
             KeyCode::Char('?') | KeyCode::F(1) => self.help(),
             _ => {}
         }
@@ -935,6 +1078,7 @@ changed since the scan are skipped, and modified files are backed up to
     fn draw(&mut self, f: &mut Frame) {
         self.hits.clear();
         let area = f.area();
+        f.render_widget(Block::new().style(self.theme.theme().main.base), area);
         let mode = std::mem::replace(&mut self.mode, Mode::Browse);
         match &mode {
             Mode::Scanning(job) => self.draw_scan(f, area, job),
@@ -961,14 +1105,14 @@ changed since the scan are skipped, and modified files are backed up to
     }
 
     fn draw_buttons(&mut self, f: &mut Frame, area: Rect, buttons: &[Button], active: bool) {
-        let key_style = Style::new().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
+        let t = self.theme.theme();
         let (pos, _) = flow(buttons, area.width);
         for (b, (x, row)) in buttons.iter().zip(pos) {
             if row >= area.height || x >= area.width {
                 break;
             }
             let rect = Rect::new(area.x + x, area.y + row, b.width().min(area.width - x), 1);
-            let line = Line::from(vec![Span::styled(format!(" {} ", b.key), key_style), Span::raw(format!(" {}", b.label))]);
+            let line = Line::from(vec![Span::styled(format!(" {} ", b.key), t.key), Span::styled(format!(" {}", b.label), t.key_label)]);
             f.render_widget(Paragraph::new(line), rect);
             if active {
                 self.hits.push((rect, Hit::Key(b.code)));
@@ -991,6 +1135,7 @@ changed since the scan are skipped, and modified files are backed up to
             Button::new("s", "Sort", c('s')),
             Button::new("r", "Rescan", c('r')),
             Button::new("m", if self.mouse { "Mouse: on" } else { "Mouse: off" }, c('m')),
+            Button::new("t", "Theme", c('t')),
             Button::new("?", "Help", c('?')),
             Button::new("q", "Quit", c('q')),
         ]
@@ -1005,6 +1150,8 @@ changed since the scan are skipped, and modified files are backed up to
     }
 
     fn draw_browse(&mut self, f: &mut Frame, area: Rect, active: bool, editing_filter: bool) {
+        let t = self.theme.theme();
+        let p = t.main;
         let buttons = self.browse_buttons();
         let (_, bar_rows) = flow(&buttons, area.width);
         let detail_rows = if area.height >= 20 { 6 } else { 0 };
@@ -1031,8 +1178,7 @@ changed since the scan are skipped, and modified files are backed up to
         if self.stale {
             text.push_str(" │ world changed: press r to rescan");
         }
-        let bar_style = Style::new().fg(Color::Black).bg(Color::Cyan);
-        f.render_widget(Paragraph::new(fit(&text, title.width as usize)).style(bar_style), title);
+        f.render_widget(Paragraph::new(fit(&text, title.width as usize)).style(t.title), title);
 
         // Column headers (click to sort).
         let c = self.cols(area.width as usize);
@@ -1047,13 +1193,12 @@ changed since the scan are skipped, and modified files are backed up to
             (SortKey::Where, "WHERE", CHECK_W + c.num + 1 + c.item + 2, c.loc),
             (SortKey::Why, "WHY", CHECK_W + c.num + 1 + c.item + 2 + c.loc + 2, c.why),
         ];
-        let head_style = Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
         for (k, name, x, w) in heads {
             if w == 0 || x >= head.width as usize {
                 continue;
             }
             let rect = Rect::new(head.x + x as u16, head.y, (w as u16).min(head.width - x as u16), 1);
-            f.render_widget(Paragraph::new(fit(&format!("{name}{}", mark(k)), w)).style(head_style), rect);
+            f.render_widget(Paragraph::new(fit(&format!("{name}{}", mark(k)), w)).style(t.head), rect);
             if active {
                 self.hits.push((rect, Hit::Sort(k)));
             }
@@ -1078,19 +1223,19 @@ changed since the scan are skipped, and modified files are backed up to
             for line in &self.coverage {
                 text.push_str(&format!("\n  {line}"));
             }
-            f.render_widget(Paragraph::new(text).style(Style::new().fg(Color::DarkGray)).wrap(Wrap { trim: false }), table);
+            f.render_widget(Paragraph::new(text).style(p.dim).wrap(Wrap { trim: false }), table);
         } else {
             let mut lines = Vec::with_capacity(h);
             for (row, &i) in self.view.iter().enumerate().skip(self.offset).take(h) {
                 let r = &self.records[i];
                 let (why, style) = match &self.state[i] {
                     RowState::Fresh => (r.why(), Style::new()),
-                    RowState::Done(s) => (s.clone(), Style::new().fg(Color::DarkGray)),
-                    RowState::Skipped(s) => (format!("skipped: {s}"), Style::new().fg(Color::Red)),
+                    RowState::Done(s) => (s.clone(), p.dim),
+                    RowState::Skipped(s) => (format!("skipped: {s}"), p.error),
                 };
-                let style = if row == self.cursor { style.add_modifier(Modifier::REVERSED) } else { style };
+                let style = if row == self.cursor { p.cursor(style) } else { style };
                 let (check, check_style) = if self.selected[i] {
-                    ("[x] ", style.fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    ("[x] ", style.patch(t.mark))
                 } else {
                     ("[ ] ", style)
                 };
@@ -1108,12 +1253,12 @@ changed since the scan are skipped, and modified files are backed up to
 
         // Details of the current finding.
         if detail_rows > 0 {
-            let block = Block::new().borders(Borders::TOP).title(" Details ");
+            let block = Block::new().borders(Borders::TOP).title(" Details ").border_style(p.border);
             let inner = block.inner(detail);
             f.render_widget(block, detail);
             if let Some(&i) = self.view.get(self.cursor) {
                 let r = &self.records[i];
-                let label = Style::new().fg(Color::Cyan);
+                let label = p.label;
                 let mut lines = vec![
                     Line::from(vec![
                         Span::styled(format!("#{} ", r.n), label),
@@ -1141,15 +1286,15 @@ changed since the scan are skipped, and modified files are backed up to
         // Status / filter line.
         let line = if editing_filter {
             Line::from(vec![
-                Span::styled("Filter: ", Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled("Filter: ", p.accent.add_modifier(Modifier::BOLD)),
                 Span::raw(self.filter.clone()),
                 Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
-                Span::styled("   Enter keeps it, Esc clears it", Style::new().fg(Color::DarkGray)),
+                Span::styled("   Enter keeps it, Esc clears it", p.dim),
             ])
         } else if !self.filter.is_empty() {
             Line::from(vec![
-                Span::styled(format!("Filter: {}", self.filter), Style::new().fg(Color::Yellow)),
-                Span::styled("  (Esc clears)   ", Style::new().fg(Color::DarkGray)),
+                Span::styled(format!("Filter: {}", self.filter), p.accent),
+                Span::styled("  (Esc clears)   ", p.dim),
                 Span::raw(self.status.clone()),
             ])
         } else {
@@ -1161,7 +1306,8 @@ changed since the scan are skipped, and modified files are backed up to
     }
 
     fn popup(&self, f: &mut Frame, rect: Rect, title: &str) -> Rect {
-        let block = Block::bordered().title(format!(" {title} ")).border_style(Style::new().fg(Color::Cyan));
+        let p = self.theme.theme().popup;
+        let block = Block::bordered().title(format!(" {title} ")).style(p.base).border_style(p.border);
         let inner = block.inner(rect);
         f.render_widget(Clear, rect);
         f.render_widget(block, rect);
@@ -1170,6 +1316,7 @@ changed since the scan are skipped, and modified files are backed up to
     }
 
     fn draw_scan(&mut self, f: &mut Frame, area: Rect, job: &ScanJob) {
+        let p = self.theme.theme().popup;
         let s = &job.stats;
         let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
         let total = load(&s.total_bytes);
@@ -1190,7 +1337,7 @@ changed since the scan are skipped, and modified files are backed up to
         f.render_widget(Paragraph::new(fit(&self.cfg.world.display().to_string(), world_row.width as usize)), world_row);
         f.render_widget(
             Gauge::default()
-                .gauge_style(Style::new().fg(Color::Cyan).bg(Color::DarkGray))
+                .gauge_style(p.gauge)
                 .ratio(ratio.clamp(0.0, 1.0))
                 .label(format!("{:.0}%", ratio * 100.0))
                 .use_unicode(true),
@@ -1199,7 +1346,7 @@ changed since the scan are skipped, and modified files are backed up to
         let lines = if total == 0 {
             vec![Line::from("Looking for world files...")]
         } else {
-            let label = Style::new().fg(Color::Cyan);
+            let label = p.label;
             let row = |a: &str, av: String, b: &str, bv: String| {
                 Line::from(vec![
                     Span::styled(format!("{a:<13}"), label),
@@ -1227,11 +1374,12 @@ changed since the scan are skipped, and modified files are backed up to
             ]
         };
         f.render_widget(Paragraph::new(lines), stats);
-        f.render_widget(Paragraph::new(self.status.clone()).style(Style::new().fg(Color::Yellow)), status);
+        f.render_widget(Paragraph::new(self.status.clone()).style(p.accent), status);
         self.draw_buttons(f, bar, &[Button::new("Esc", "Cancel", KeyCode::Esc)], true);
     }
 
     fn draw_working(&mut self, f: &mut Frame, area: Rect, job: &ApplyJob) {
+        let p = self.theme.theme().popup;
         let total = job.progress.files_total.load(Ordering::Relaxed);
         let done = job.progress.files_done.load(Ordering::Relaxed).min(total);
         let ratio = if total == 0 { 0.0 } else { done as f64 / total as f64 };
@@ -1249,7 +1397,7 @@ changed since the scan are skipped, and modified files are backed up to
         f.render_widget(Paragraph::new(fit(&what_text, what.width as usize)), what);
         f.render_widget(
             Gauge::default()
-                .gauge_style(Style::new().fg(Color::Cyan).bg(Color::DarkGray))
+                .gauge_style(p.gauge)
                 .ratio(ratio.clamp(0.0, 1.0))
                 .label(format!("{:.0}%", ratio * 100.0))
                 .use_unicode(true),
@@ -1266,6 +1414,7 @@ changed since the scan are skipped, and modified files are backed up to
     }
 
     fn draw_menu(&mut self, f: &mut Frame, area: Rect, cursor: usize) {
+        let p = self.theme.theme().popup;
         let n = self.targets().len();
         let title = format!("Action for {} item stack(s)", human_count(n as u64));
         let inner = self.popup(f, centered(area, 64, MENU.len() as u16 + 4), &title);
@@ -1274,9 +1423,9 @@ changed since the scan are skipped, and modified files are backed up to
                 break;
             }
             let rect = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
-            let style = if i == cursor { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+            let style = if i == cursor { p.cursor(Style::new()) } else { Style::new() };
             let line = Line::from(vec![
-                Span::styled(format!(" {hotkey} "), style.fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {hotkey} "), style.patch(p.hotkey)),
                 Span::styled(fit(&format!(" {label}"), (inner.width as usize).saturating_sub(3)), style),
             ]);
             f.render_widget(Paragraph::new(line), rect);
@@ -1294,6 +1443,7 @@ changed since the scan are skipped, and modified files are backed up to
     }
 
     fn draw_input(&mut self, f: &mut Frame, area: Rect, act: Act, text: &str, error: Option<&str>) {
+        let p = self.theme.theme().popup;
         let (_, _, label, prompt) = menu_entry(act);
         let inner = self.popup(f, centered(area, 72, 8), label.trim_end_matches('.'));
         let [prompt_row, input, _, err, _, bar] = Layout::vertical([
@@ -1305,21 +1455,21 @@ changed since the scan are skipped, and modified files are backed up to
             Constraint::Length(1),
         ])
         .areas(inner);
-        f.render_widget(Paragraph::new(*prompt).style(Style::new().fg(Color::DarkGray)), prompt_row);
+        f.render_widget(Paragraph::new(*prompt).style(p.dim), prompt_row);
         // Keep the end of a long value in view.
         let room = (input.width as usize).saturating_sub(3);
         let skip = text.chars().count().saturating_sub(room);
         let shown: String = text.chars().skip(skip).collect();
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("> ", Style::new().fg(Color::Yellow)),
+                Span::styled("> ", p.accent),
                 Span::raw(shown),
                 Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
             ])),
             input,
         );
         if let Some(e) = error {
-            f.render_widget(Paragraph::new(fit(e, err.width as usize)).style(Style::new().fg(Color::Red)), err);
+            f.render_widget(Paragraph::new(fit(e, err.width as usize)).style(p.error), err);
         }
         self.draw_buttons(
             f,
@@ -1330,6 +1480,7 @@ changed since the scan are skipped, and modified files are backed up to
     }
 
     fn draw_pager(&mut self, f: &mut Frame, area: Rect, title: &str, lines: &[String], scroll: usize, kind: &PagerKind) {
+        let p = self.theme.theme().popup;
         let widest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
         let w = (widest + 4).clamp(50, area.width.saturating_sub(4).max(50));
         let h = (lines.len() as u16 + 4).clamp(7, area.height.saturating_sub(2).max(7));
@@ -1343,7 +1494,7 @@ changed since the scan are skipped, and modified files are backed up to
             .take(body.height as usize)
             .map(|l| {
                 let style = if l.contains(" SKIPPED ") || l.starts_with("warning:") {
-                    Style::new().fg(Color::Red)
+                    p.error
                 } else if l.starts_with("DRY RUN") || l.starts_with("Done:") {
                     Style::new().add_modifier(Modifier::BOLD)
                 } else {
@@ -1467,6 +1618,7 @@ mod tests {
             world: PathBuf::from("/nonexistent/world"),
             loaded: Some((header, records)),
             mouse: true,
+            theme: ThemeName::Default,
             backup: true,
             force: false,
             threads: Some(1),
@@ -1525,6 +1677,43 @@ mod tests {
         for needle in ["4 finding(s)", "0 selected", "bedrock", "zombie_spawn_egg", "chest @ overworld 1 2 3 slot 0", "Details", "Fix", "Mouse: on", "Quit"] {
             assert!(all.contains(needle), "{needle:?} missing:\n{all}");
         }
+    }
+
+    #[test]
+    fn midnight_commander_theme() {
+        let style_at = |app: &mut App, x: u16, y: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let c = terminal.backend().buffer().cell((x, y)).unwrap().clone();
+            (c.fg, c.bg, c.modifier)
+        };
+        let mut app = app();
+        // The default theme leaves the terminal's colours alone and reverses the cursor row.
+        let (_, bg, modifier) = style_at(&mut app, 119, 4);
+        assert_eq!(bg, Color::Reset);
+        assert!(!modifier.contains(Modifier::REVERSED));
+        assert!(style_at(&mut app, 10, 2).2.contains(Modifier::REVERSED));
+
+        app.on_key(key(KeyCode::Char('t')));
+        assert_eq!(app.theme, ThemeName::Mc);
+        assert!(app.status.contains("Midnight Commander"), "{}", app.status);
+        // Blue panel, black-on-cyan cursor bar, yellow tick on a selected row.
+        assert_eq!(style_at(&mut app, 119, 4), (Color::Gray, Color::Blue, Modifier::empty()));
+        assert_eq!(style_at(&mut app, 10, 2), (Color::Black, Color::Cyan, Modifier::empty()));
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Down));
+        let (fg, bg, _) = style_at(&mut app, 1, 2);
+        assert_eq!((fg, bg), (Color::Yellow, Color::Blue));
+        // Popups are grey dialogs.
+        app.on_key(key(KeyCode::Char('?')));
+        let lines = screen(&mut app, 120, 30);
+        let (x, y) = find(&lines, "Moving");
+        assert_eq!(style_at(&mut app, x, y).1, Color::Gray);
+        app.on_key(key(KeyCode::Esc));
+
+        app.on_key(key(KeyCode::Char('t')));
+        assert_eq!(app.theme, ThemeName::Default);
+        assert_eq!(style_at(&mut app, 119, 4).1, Color::Reset);
     }
 
     #[test]

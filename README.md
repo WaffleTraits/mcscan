@@ -76,6 +76,7 @@ file, so the commands below keep working on it.
 | `e` | more actions: clamp or strip enchantments, set count, set/remove NBT, … |
 | `r` | rescan |
 | `m` | mouse support on/off |
+| `t` | switch theme: default / Midnight Commander |
 | `?`, `q` | help, quit |
 
 The mouse is optional. With it on (the default), click a row to move to it,
@@ -83,6 +84,10 @@ its `[ ]` box or right-click to select it, double-click for details, a column
 header to sort, any button along the bottom or in a popup instead of pressing
 its key, and use the wheel to scroll. Press `m` (or start with `--no-mouse`)
 to turn it off, which gives the terminal's own text selection back.
+
+Two colour themes are included. The default follows your terminal's own
+colours; `mcscan tui --theme mc <world>` (or `t` inside) gives the
+Midnight Commander look: blue panel, cyan bars and grey dialogs.
 
 The same safety rules as `apply` hold: changes are refused while a game or
 server has the world open (`--force` overrides), items that changed since the

@@ -216,6 +216,9 @@ struct TuiArgs {
     /// Start with mouse support off (press m inside to toggle; off lets the terminal select text)
     #[arg(long)]
     no_mouse: bool,
+    /// Colours: `default` follows the terminal, `mc` looks like Midnight Commander (press t inside to switch)
+    #[arg(long, value_enum, default_value_t, value_name = "NAME")]
+    theme: tui::ThemeName,
     /// Do not copy modified files to <world>/mcscan-backups/ first
     #[arg(long)]
     no_backup: bool,
@@ -339,6 +342,7 @@ fn tui_cmd(a: TuiArgs) -> Result<()> {
         world,
         loaded,
         mouse: !a.no_mouse,
+        theme: a.theme,
         backup: !a.no_backup,
         force: a.force,
         threads,
