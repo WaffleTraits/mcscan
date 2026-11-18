@@ -8,6 +8,7 @@
 mod apply;
 mod filter;
 mod item;
+mod live;
 mod nbt;
 mod preset;
 mod progress;
@@ -28,6 +29,9 @@ Typical session:
   mcscan list mcscan-results.jsonl                          # 2. review
   mcscan apply mcscan-results.jsonl --all --fix --dry-run   # 3. preview
   mcscan apply mcscan-results.jsonl --all --fix             # 4. do it (server stopped)
+
+With the optional mcscan-live mod on a Fabric server, add --live to scan and
+apply (or tui) to work on the running server instead of stopping it.
 
 Or do all of it in one full-screen session:
   mcscan tui /srv/minecraft/world
@@ -63,6 +67,39 @@ enum Command {
     Rules(RulesArgs),
     /// Describe the --filter expression language
     Fields,
+}
+
+/// Working through the companion mod on a running server.
+#[derive(Args, Clone, Default)]
+struct LiveArgs {
+    /// Work with the running server through the mcscan-live mod: scans make it save first,
+    /// changes are made inside the game instead of in the files
+    #[arg(long, help_heading = "Live server")]
+    live: bool,
+    /// The mod's config file (implies --live) [default: config/mcscan-live.json next to the world folder]
+    #[arg(long, value_name = "FILE", help_heading = "Live server")]
+    live_config: Option<PathBuf>,
+}
+
+impl LiveArgs {
+    fn settings(&self) -> Option<live::Settings> {
+        (self.live || self.live_config.is_some()).then(|| live::Settings { config: self.live_config.clone() })
+    }
+}
+
+/// Have the server write everything it holds in memory to the world files.
+fn save_first(world: &std::path::Path, settings: &live::Settings, quiet: bool) -> Result<()> {
+    let mut client = live::Client::connect(world, settings)?;
+    if !quiet {
+        eprintln!(
+            "Connected to mcscan-live {} (Minecraft {}); asking the server to save...",
+            client.info.mod_version, client.info.minecraft
+        );
+        if let Some(w) = client.world_mismatch(world) {
+            eprintln!("warning: {w}");
+        }
+    }
+    client.save()
 }
 
 #[derive(Args, Clone)]
@@ -105,6 +142,8 @@ struct ScanArgs {
     /// No progress or summary output
     #[arg(short, long)]
     quiet: bool,
+    #[command(flatten)]
+    live: LiveArgs,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -207,6 +246,8 @@ struct ApplyArgs {
     /// Worker threads [default: all cores]
     #[arg(short = 'j', long, value_name = "N")]
     threads: Option<usize>,
+    #[command(flatten)]
+    live: LiveArgs,
 }
 
 #[derive(Args)]
@@ -297,11 +338,16 @@ fn build_scan(a: &ScanArgs) -> Result<scan::ScanOptions> {
         snbt: a.snbt,
         quiet: a.quiet,
         threads: a.threads,
+        saved_first: a.live.settings().is_some(),
     })
 }
 
 fn scan_cmd(a: ScanArgs) -> Result<()> {
-    scan::run(build_scan(&a)?)
+    let opts = build_scan(&a)?;
+    if let Some(settings) = a.live.settings() {
+        save_first(&a.world, &settings, a.quiet)?;
+    }
+    scan::run(opts)
 }
 
 fn tui_cmd(a: TuiArgs) -> Result<()> {
@@ -336,11 +382,20 @@ fn tui_cmd(a: TuiArgs) -> Result<()> {
     let threads = args.threads;
     let results_path = args.output.clone();
     let world = args.world.clone();
+    let live = args.live.settings();
+    let saver = live.clone();
     tui::run(tui::Config {
-        make_scan: std::sync::Arc::new(move || build_scan(&args)),
+        make_scan: std::sync::Arc::new(move || {
+            let opts = build_scan(&args)?;
+            if let Some(settings) = &saver {
+                save_first(&args.world, settings, true)?;
+            }
+            Ok(opts)
+        }),
         results_path,
         world,
         loaded,
+        live,
         mouse: !a.no_mouse,
         theme: a.theme,
         backup: !a.no_backup,
@@ -492,6 +547,7 @@ fn apply_cmd(a: ApplyArgs) -> Result<()> {
             yes: a.yes,
             interactive: a.interactive,
             threads: a.threads,
+            live: a.live.settings(),
         },
         picked,
     )

@@ -39,6 +39,8 @@ pub struct ScanOptions {
     pub snbt: bool,
     pub quiet: bool,
     pub threads: Option<usize>,
+    /// The server was asked to save just before (`--live`), so the files are current.
+    pub saved_first: bool,
 }
 
 /// Live counters of a running scan, shared with whatever displays progress.
@@ -478,10 +480,11 @@ fn progress_line(stats: &Stats, eta: &Eta) -> String {
 pub fn run(opts: ScanOptions) -> Result<()> {
     let plan = plan(&opts)?;
     if !opts.quiet {
-        if let Some(pid) = world::lock_holder(&plan.world) {
+        if let Some(pid) = world::lock_holder(&plan.world).filter(|_| !opts.saved_first) {
             eprintln!(
                 "note: this world is open in a running game/server (pid {pid}). Scanning is safe, but\n      \
-                 changes still in memory are not on disk yet - run `save-all flush` first for an exact result."
+                 changes still in memory are not on disk yet - run `save-all flush` first for an exact result\n      \
+                 (--live does that for you if the server has the mcscan-live mod)."
             );
         }
         for other in world::sibling_worlds(&plan.world) {

@@ -100,6 +100,8 @@ pub struct ApplyOptions {
     pub yes: bool,
     pub interactive: bool,
     pub threads: Option<usize>,
+    /// Edit inside the running server through the mcscan-live mod instead of in the files.
+    pub live: Option<crate::live::Settings>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,7 +290,7 @@ pub fn process_tree(root: &mut Compound, recs: &[&Record], opts: &ApplyOptions) 
     let mut valid: Vec<&Record> = Vec::new();
     for &rec in recs {
         match nbt::get_path(root, &rec.path) {
-            Some(Tag::Compound(c)) if format!("{:016x}", nbt::fingerprint(c)) == rec.hash => valid.push(rec),
+            Some(Tag::Compound(c)) if nbt::fingerprint_matches(c, &rec.hash) => valid.push(rec),
             Some(_) => outcomes.push(skipped(rec, "changed since the scan - rescan first")),
             None => outcomes.push(skipped(rec, "no longer there - rescan first")),
         }
@@ -366,6 +368,10 @@ pub struct Report {
     pub files: usize,
     /// Where the originals went, if anything was backed up.
     pub backup_dir: Option<PathBuf>,
+    /// Live edits: the file on the server that records what every change replaced.
+    pub journal: Option<String>,
+    /// The changes went through the running server instead of into the files.
+    pub live: bool,
     pub warnings: Vec<String>,
 }
 
@@ -386,7 +392,12 @@ impl Report {
 
     pub fn summary(&self) -> String {
         let (changed, deleted, unchanged, skips) = self.counts();
-        let prefix = if self.dry_run { "DRY RUN - nothing was written. Would have: " } else { "Done: " };
+        let prefix = match (self.dry_run, self.live) {
+            (true, false) => "DRY RUN - nothing was written. Would have: ",
+            (true, true) => "DRY RUN against the running server - nothing was changed. Would have: ",
+            (false, false) => "Done: ",
+            (false, true) => "Done, live on the running server: ",
+        };
         format!("{prefix}{changed} changed, {deleted} deleted, {unchanged} already fine, {skips} skipped.")
     }
 }
@@ -564,7 +575,8 @@ pub fn ensure_unlocked(opts: &ApplyOptions) -> Result<Option<i64>> {
     match crate::world::lock_holder(&opts.world) {
         Some(pid) if !opts.force => bail!(
             "this world is open in a running game/server (pid {pid}). Stop it first: the server would \
-             overwrite the changes and can corrupt chunks it has loaded. (--force overrides; a dry run is always safe)"
+             overwrite the changes and can corrupt chunks it has loaded. (A dry run is always safe; --live edits \
+             through the mcscan-live mod while the server runs; --force overrides.)"
         ),
         other => Ok(other),
     }
@@ -578,6 +590,9 @@ pub fn execute(opts: &ApplyOptions, selected: &[&Record], progress: &Progress) -
     }
     if !opts.world.is_dir() {
         bail!("world folder {} not found (use --world if it has moved since the scan)", opts.world.display());
+    }
+    if let Some(settings) = &opts.live {
+        return crate::live::execute(opts, selected, progress, settings);
     }
     if !opts.dry_run {
         ensure_unlocked(opts)?;
@@ -609,6 +624,8 @@ pub fn execute(opts: &ApplyOptions, selected: &[&Record], progress: &Progress) -
         dry_run: opts.dry_run,
         files: groups.len(),
         backup_dir: backup_dir.filter(|d| d.exists()),
+        journal: None,
+        live: false,
         warnings: run.warnings.into_inner().unwrap_or_else(|e| e.into_inner()),
     })
 }
@@ -636,12 +653,18 @@ pub fn run(opts: ApplyOptions, selected: Vec<&Record>) -> Result<()> {
     }
 
     if !opts.dry_run {
-        if let Some(pid) = ensure_unlocked(&opts)? {
-            eprintln!("warning: world is in use by pid {pid}; continuing because of --force");
+        if opts.live.is_none() {
+            if let Some(pid) = ensure_unlocked(&opts)? {
+                eprintln!("warning: world is in use by pid {pid}; continuing because of --force");
+            }
         }
         if !opts.yes && !opts.interactive {
             let files: HashSet<&str> = selected.iter().map(|r| r.file.as_str()).collect();
-            eprintln!("About to {action} on {} item stack(s) in {} file(s) under {}", selected.len(), files.len(), opts.world.display());
+            if opts.live.is_some() {
+                eprintln!("About to {action} on {} item stack(s), live on the running server of {}", selected.len(), opts.world.display());
+            } else {
+                eprintln!("About to {action} on {} item stack(s) in {} file(s) under {}", selected.len(), files.len(), opts.world.display());
+            }
             if !std::io::stdin().is_terminal() {
                 bail!("refusing to modify the world without confirmation: pass --yes (or try --dry-run)");
             }
@@ -673,8 +696,11 @@ pub fn run(opts: ApplyOptions, selected: Vec<&Record>) -> Result<()> {
             writeln!(w, "Originals of every modified file are in {}", dir.display())?;
         }
     }
+    if let Some(journal) = &report.journal {
+        writeln!(w, "What every change replaced is recorded on the server in {journal}")?;
+    }
     if skips > 0 {
-        writeln!(w, "Skipped items no longer match the scan; run `mcscan scan` again to pick them up.")?;
+        writeln!(w, "Skipped items were not touched; run `mcscan scan` again to pick up the ones that changed.")?;
     }
     w.flush()?;
     Ok(())
@@ -702,7 +728,7 @@ pub fn load_item(world: &Path, rec: &Record, inflater: &mut Inflater, buf: &mut 
     };
     Ok(match nbt::get_path(&root, &rec.path) {
         Some(Tag::Compound(c)) => {
-            Live::Item { item: c.clone(), unchanged: format!("{:016x}", nbt::fingerprint(c)) == rec.hash }
+            Live::Item { item: c.clone(), unchanged: nbt::fingerprint_matches(c, &rec.hash) }
         }
         _ => Live::ItemGone,
     })
@@ -796,6 +822,7 @@ mod tests {
             yes: true,
             interactive: false,
             threads: None,
+            live: None,
         }
     }
 

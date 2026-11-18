@@ -668,18 +668,50 @@ pub fn write_root(name: &str, root: &Compound) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Stable 64-bit fingerprint (FNV-1a over the binary encoding) of a compound.
-/// Used to make sure an item is still what the scan saw before editing it.
-pub fn fingerprint(c: &Compound) -> u64 {
-    let mut buf = Vec::with_capacity(256);
-    // A compound that cannot be serialised cannot be on disk either.
-    let _ = write_compound(c, &mut buf);
+fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in buf {
-        h ^= b as u64;
+    for b in bytes {
+        h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+/// A copy with the keys of every compound in sorted order.
+fn sorted_keys(tag: &Tag) -> Tag {
+    match tag {
+        Tag::Compound(c) => {
+            let mut entries: Vec<(String, Tag)> = c.0.iter().map(|(k, v)| (k.clone(), sorted_keys(v))).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Tag::Compound(Compound(entries))
+        }
+        Tag::List(l) => Tag::List(List { elem: l.elem, items: l.items.iter().map(sorted_keys).collect() }),
+        other => other.clone(),
+    }
+}
+
+/// Stable 64-bit fingerprint of a compound: FNV-1a over its binary encoding
+/// with the keys of every compound sorted. Used to make sure an item is still
+/// what the scan saw before editing it. The game keeps compounds in hash maps,
+/// so the order of keys can differ between two saves of the same item (and
+/// between the files and the running game); the fingerprint must not.
+pub fn fingerprint(c: &Compound) -> u64 {
+    let Tag::Compound(sorted) = sorted_keys(&Tag::Compound(c.clone())) else { unreachable!() };
+    let mut buf = Vec::with_capacity(256);
+    // A compound that cannot be serialised cannot be on disk either.
+    let _ = write_compound(&sorted, &mut buf);
+    fnv1a(&buf)
+}
+
+/// Does `c` have the fingerprint `hash` that a scan recorded? Also accepts the
+/// key-order-sensitive fingerprint written by mcscan before 0.2.
+pub fn fingerprint_matches(c: &Compound, hash: &str) -> bool {
+    if format!("{:016x}", fingerprint(c)) == hash {
+        return true;
+    }
+    let mut buf = Vec::with_capacity(256);
+    let _ = write_compound(c, &mut buf);
+    format!("{:016x}", fnv1a(&buf)) == hash
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1051,28 @@ pub fn parse_snbt(s: &str) -> Result<Tag> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_ignores_key_order() {
+        let c = |s: &str| match parse_snbt(s).unwrap() {
+            Tag::Compound(c) => c,
+            _ => panic!(),
+        };
+        let a = c(r#"{id:"minecraft:stone",count:3,components:{"minecraft:damage":1,"minecraft:lore":[{a:1,b:2}]}}"#);
+        let b = c(r#"{components:{"minecraft:lore":[{b:2,a:1}],"minecraft:damage":1},count:3,id:"minecraft:stone"}"#);
+        assert_ne!(a, b);
+        assert_eq!(fingerprint(&a), fingerprint(&b));
+        assert_ne!(fingerprint(&a), fingerprint(&c(r#"{id:"minecraft:stone",count:4}"#)));
+        // List order is content, not presentation.
+        assert_ne!(fingerprint(&c("{l:[1,2]}")), fingerprint(&c("{l:[2,1]}")));
+        // Results files from before the fingerprint was order-independent still verify.
+        let mut buf = Vec::new();
+        write_compound(&b, &mut buf).unwrap();
+        let old = format!("{:016x}", fnv1a(&buf));
+        assert!(fingerprint_matches(&b, &old));
+        assert!(!fingerprint_matches(&a, &old));
+        assert!(fingerprint_matches(&a, &format!("{:016x}", fingerprint(&b))));
+    }
 
     fn sample() -> Compound {
         let mut item = Compound::default();

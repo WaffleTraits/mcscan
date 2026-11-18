@@ -165,8 +165,9 @@ Actions: `--fix` (apply each rule's own remedy), `--delete`, `--set-count N`,
 
 Safety:
 
-* **Stop the server before `apply`.** mcscan refuses to write while a
-  game/server holds the world's `session.lock` (`--force` overrides).
+* **Stop the server before `apply`**, or use `--live` (next section). mcscan
+  refuses to write while a game/server holds the world's `session.lock`
+  (`--force` overrides).
 * Every item is re-read and compared with the fingerprint taken by the scan;
   anything that changed since is skipped, never guessed at.
 * Modified files are first copied to `<world>/mcscan-backups/<timestamp>/`
@@ -175,6 +176,58 @@ Safety:
   Untouched chunks are copied byte-for-byte.
 * `--dry-run` shows exactly what would happen; without `--yes` you are asked
   to confirm.
+
+## Live changes on a running server (optional)
+
+Normally the server has to be stopped before `apply`. With the companion
+Fabric mod **mcscan-live** installed on the server, adding `--live` makes
+mcscan work with the running game instead:
+
+```sh
+mcscan scan  /srv/minecraft/world -p illegal --live     # server saves first, then the files are scanned
+mcscan apply mcscan-results.jsonl --all --fix --dry-run --live
+mcscan apply mcscan-results.jsonl --all --fix --live    # changed inside the running game
+mcscan tui   /srv/minecraft/world --live                # the same, full-screen
+```
+
+* `scan --live` asks the server for the equivalent of `save-all flush`
+  first, so the scan sees what is in memory, not what was last autosaved.
+* `apply --live` does not touch the world files. For each chest, entity or
+  player it fetches the current NBT from the game, checks every item against
+  the scan's fingerprint as usual, and sends the change back as a
+  compare-and-swap. The mod applies it between two ticks, and only if that
+  inventory is still exactly what mcscan fetched — if a hopper or a player
+  moved something in the meantime, mcscan looks again (up to four times)
+  instead of overwriting it. Nothing is lost or duplicated.
+* It reaches block entities (unloaded chunks are loaded for the edit),
+  entities including passengers, online players (inventory, ender chest,
+  armour and off hand) and offline players. Findings in `level.dat` or
+  command storage are skipped with a message; those need the server stopped.
+* Instead of file backups, the mod appends what every change replaced to
+  `logs/mcscan-live.log` on the server (`--no-backup` to skip).
+* Everything else is unchanged: `--dry-run`, the confirmation prompt, the
+  selection options and the actions.
+
+Setting it up:
+
+1. Put `mcscan-live-1.0.0.jar` (in `dist/`, or build it: `cd fabric-mod &&
+   ./gradlew build`, needs JDK 25) into the server's `mods/` folder next to
+   Fabric API. It is server-side only; players need nothing. It also works
+   in a single-player world.
+2. Start the server once. The mod writes `config/mcscan-live.json` with a
+   random token and listens on `127.0.0.1:25599`.
+3. Run mcscan with `--live` on the same machine. It finds that file from
+   the world folder (`<world>/../config/`); `--live-config FILE` points at
+   it explicitly.
+
+The mod accepts connections from the local machine only and requires the
+token, which is readable only by the user running the server. Anyone who can
+read that file can edit items on the server, so treat it like the RCON
+password. To use it from another machine, set `"bind"` in the config to an
+address that machine can reach, keep the port firewalled to it, and give
+mcscan a copy of the file with a `"host"` entry added. `"enabled": false`
+switches the mod off. See [`fabric-mod/README.md`](fabric-mod/README.md) for
+the protocol.
 
 ## The `illegal` preset
 

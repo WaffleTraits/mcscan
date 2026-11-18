@@ -1,0 +1,26 @@
+{
+	"schemaVersion": 1,
+	"id": "mcscan-live",
+	"version": "${version}",
+	"name": "mcscan live",
+	"description": "Server-side companion of the mcscan world scanner: lets mcscan save the world before a scan and delete or modify the items it found while the server keeps running. Listens on localhost only and needs the token from config/mcscan-live.json.",
+	"authors": [
+		"WaffleTraits"
+	],
+	"contact": {
+		"sources": "https://github.com/WaffleTraits/mcscan"
+	},
+	"license": "MIT",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"mcscan.live.McscanLive"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.20.1",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-lifecycle-events-v1": "*"
+	}
+}

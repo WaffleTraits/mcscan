@@ -45,6 +45,8 @@ pub struct Config {
     pub world: PathBuf,
     /// Findings to start with; `None` scans first.
     pub loaded: Option<(Header, Vec<Record>)>,
+    /// Apply changes through the mcscan-live mod on the running server.
+    pub live: Option<crate::live::Settings>,
     pub mouse: bool,
     pub theme: ThemeName,
     pub backup: bool,
@@ -580,7 +582,9 @@ impl App {
                 if out.errors > 0 {
                     status.push_str(&format!(" - {} unreadable chunk(s)/file(s) skipped", human_count(out.errors)));
                 }
-                if world::lock_holder(&PathBuf::from(&out.header.world)).is_some() {
+                if self.cfg.live.is_some() {
+                    status.push_str(" - live: the server saved first, changes are made inside the running game");
+                } else if world::lock_holder(&PathBuf::from(&out.header.world)).is_some() {
                     status.push_str(" - world is open in a running server: stop it before applying changes");
                 }
                 self.status = status;
@@ -611,6 +615,7 @@ impl App {
             yes: true,
             interactive: false,
             threads: self.cfg.threads,
+            live: self.cfg.live.clone(),
         };
         let (shared, picked) = (progress.clone(), targets.clone());
         std::thread::spawn(move || {
@@ -641,15 +646,19 @@ impl App {
         let (changed, deleted, _, skips) = report.counts();
         let mut lines = vec![
             format!(
-                "Action: {} - {} item stack(s) in {} file(s)",
+                "Action: {} - {} item stack(s) in {} {}",
                 job.ops.describe(),
                 human_count(job.targets.len() as u64),
-                human_count(report.files as u64)
+                human_count(report.files as u64),
+                if report.live { "inventories on the running server" } else { "file(s)" }
             ),
             report.summary(),
         ];
         if let Some(dir) = &report.backup_dir {
             lines.push(format!("Originals of every modified file are in {}", dir.display()));
+        }
+        if let Some(journal) = &report.journal {
+            lines.push(format!("What every change replaced is recorded on the server in {journal}"));
         }
         for w in &report.warnings {
             lines.push(format!("warning: {w}"));
@@ -756,6 +765,8 @@ Other
   r                   rescan the world
   m                   mouse support on/off (off lets the terminal select text)
   t                   switch theme: default / Midnight Commander
+  Started with --live (title says LIVE), scans make the server save first and
+  changes are made inside the running game through the mcscan-live mod.
   ?                   this help              q, Ctrl-C   quit
 
 Changes are refused while a game or server has the world open, items that
@@ -827,7 +838,7 @@ changed since the scan are skipped, and modified files are backed up to
     }
 
     fn apply_for_real(&mut self, ops: Ops, targets: Vec<usize>) {
-        if !self.cfg.force {
+        if !self.cfg.force && self.cfg.live.is_none() {
             if let Some(pid) = world::lock_holder(&self.world) {
                 self.message(
                     "World is in use",
@@ -836,6 +847,9 @@ changed since the scan are skipped, and modified files are backed up to
                         String::new(),
                         "Stop it first: the server would overwrite the changes and can corrupt".to_string(),
                         "chunks it has loaded. Nothing was written.".to_string(),
+                        String::new(),
+                        "With the mcscan-live mod on the server, start mcscan with --live to make".to_string(),
+                        "the changes inside the running game instead.".to_string(),
                     ],
                 );
                 return;
@@ -1167,7 +1181,8 @@ changed since the scan are skipped, and modified files are backed up to
 
         // Title bar.
         let mut text = format!(
-            " mcscan │ {} │ {} finding(s)",
+            " mcscan{} │ {} │ {} finding(s)",
+            if self.cfg.live.is_some() { " LIVE" } else { "" },
             self.world.display(),
             human_count(self.records.len() as u64)
         );
@@ -1617,6 +1632,7 @@ mod tests {
             results_path: "unused.jsonl".into(),
             world: PathBuf::from("/nonexistent/world"),
             loaded: Some((header, records)),
+            live: None,
             mouse: true,
             theme: ThemeName::Default,
             backup: true,
